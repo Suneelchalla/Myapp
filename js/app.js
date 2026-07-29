@@ -299,6 +299,7 @@ function applyBadge(total) {
 }
 async function refreshBadge() {
   if (!state.user || !getToken()) return;
+  if (state.route.name === "chats") return; // chat-list refresh already updates the badge
   try {
     const { conversations } = await call("listConversations", {});
     await DB.putConversations(conversations);
@@ -439,7 +440,8 @@ async function renderConversation(conversationId) {
     conversationId,
     otherUser: other,
     lastSequence: 0,
-    clearedBefore: conv?.clearedBeforeSequence || 0
+    clearedBefore: conv?.clearedBeforeSequence || 0,
+    readUpTo: 0
   };
 
   const menuBtn = el("button", { class: "iconbtn", "aria-label": "Conversation options", html: ICON.more, onclick: () => convMenu(conversationId) });
@@ -462,6 +464,7 @@ async function renderConversation(conversationId) {
   const grow = () => { textarea.style.height = "auto"; textarea.style.height = Math.min(textarea.scrollHeight, 140) + "px"; sendBtn.disabled = textarea.value.trim() === ""; };
   textarea.addEventListener("input", grow);
   textarea.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !isMobile()) { e.preventDefault(); doSend(); } });
+  textarea.addEventListener("focus", () => setTimeout(() => scrollBottom(thread), 350));
   sendBtn.addEventListener("click", doSend);
 
   async function doSend() {
@@ -499,7 +502,7 @@ async function pollConversation(thread, first) {
   if (!ac) return;
   await flushPending();
   try {
-    const { messages } = await call("getMessages", { conversationId: ac.conversationId, afterSequence: ac.lastSequence });
+    const { messages, readUpTo } = await call("getMessages", { conversationId: ac.conversationId, afterSequence: ac.lastSequence });
     if (messages.length) {
       await DB.putMessages(ac.conversationId, messages);
       const wasBottom = nearBottom(thread);
@@ -508,10 +511,11 @@ async function pollConversation(thread, first) {
       if (wasBottom || first) scrollBottom(thread);
       markRead(ac.conversationId, ac.lastSequence);
     }
-  } catch (e) { if (!(e instanceof ApiError && e.code === "NETWORK")) { /* keep quiet on transient */ } }
+    if (readUpTo != null && readUpTo > ac.readUpTo) { ac.readUpTo = readUpTo; markReadTicks(readUpTo); }
+  } catch (e) { /* transient GAS hiccup: stay quiet, next poll retries */ }
 
   // refresh presence every ~5 ticks
-  state.poll.presenceTick = (state.poll.presenceTick + 1) % 5;
+  state.poll.presenceTick = (state.poll.presenceTick + 1) % 8;
   if (first || state.poll.presenceTick === 0) refreshPresence();
 }
 async function refreshPresence() {
@@ -560,17 +564,22 @@ function bubble(m) {
   const mine = m.senderId === state.user.userId;
   const node = el("div", {
     class: "bubble " + (mine ? "bubble--mine" : "bubble--theirs") + (m.status === "failed" ? " bubble--failed" : ""),
-    dataset: { day: dayLabel(m.createdAt), cid: m.clientMessageId || "", mid: m.messageId || "" }
+    dataset: { day: dayLabel(m.createdAt), cid: m.clientMessageId || "", mid: m.messageId || "", seq: String(m.sequenceNumber || 0) }
   });
   if (m.deleted) {
     node.appendChild(el("p", { class: "bubble__text bubble__text--deleted", text: "This message was deleted" }));
   } else {
     node.appendChild(el("p", { class: "bubble__text", text: m.text }));   // textContent — XSS-safe
   }
+  let tickState = m.status;
+  if (mine && !m.deleted && (m.status === "sent" || m.status === "read")) {
+    const readUpTo = (state.activeConversation && state.activeConversation.readUpTo) || 0;
+    tickState = (m.sequenceNumber && m.sequenceNumber <= readUpTo) ? "read" : "sent";
+  }
   const meta = el("div", { class: "bubble__meta" }, [
     m.editedAt ? el("span", { class: "bubble__edited", text: "edited" }) : null,
     el("span", { class: "bubble__time", text: timeOf(m.createdAt) }),
-    mine ? statusIcon(m.status) : null
+    mine ? statusIcon(tickState) : null
   ].filter(Boolean));
   node.appendChild(meta);
   if (!m.deleted) node.addEventListener("click", () => messageMenu(m, mine));
@@ -579,7 +588,22 @@ function bubble(m) {
 function statusIcon(status) {
   if (status === "pending") return el("span", { class: "tick tick--pending", html: ICON.clock, "aria-label": "sending" });
   if (status === "failed") return el("span", { class: "tick tick--failed", html: ICON.alert, "aria-label": "failed" });
+  if (status === "read") return el("span", { class: "tick tick--read", html: ICON.checks, "aria-label": "seen" });
   return el("span", { class: "tick tick--sent", html: ICON.check, "aria-label": "sent" });
+}
+// Update tick marks in place when the other person's read position advances.
+function markReadTicks(readUpTo) {
+  const thread = $("#thread");
+  if (!thread) return;
+  thread.querySelectorAll(".bubble--mine").forEach((b) => {
+    const seq = Number(b.dataset.seq) || 0;
+    if (seq && seq <= readUpTo) {
+      const tick = b.querySelector(".tick");
+      if (tick && !tick.classList.contains("tick--read") && !tick.classList.contains("tick--pending") && !tick.classList.contains("tick--failed")) {
+        tick.replaceWith(statusIcon("read"));
+      }
+    }
+  });
 }
 
 function messageMenu(m, mine) {
@@ -876,11 +900,15 @@ async function flushPending() {
           state.activeConversation.lastSequence = Math.max(state.activeConversation.lastSequence, message.sequenceNumber || 0);
         }
       } catch (e) {
-        if (e instanceof ApiError && e.code === "NETWORK") break;       // offline: stop, keep queue
-        item.status = "failed"; await DB.addPending(item);              // real error: mark failed
+        const code = e instanceof ApiError ? e.code : "NETWORK";
+        // Transient (offline, cold start, temporary server hiccup): keep the
+        // message queued and retry next cycle. Resends are safe — the server
+        // de-duplicates by clientMessageId — so nothing sends twice.
+        if (["NETWORK", "BAD_RESPONSE", "INTERNAL_ERROR", "RATE_LIMITED"].includes(code)) break;
+        // Genuine error (e.g. validation): flag the bubble, no popup.
+        item.status = "failed"; await DB.addPending(item);
         const node = document.querySelector(`[data-cid="${CSS.escape(item.clientMessageId)}"]`);
         if (node) { node.classList.add("bubble--failed"); node.querySelector(".tick")?.replaceWith(statusIcon("failed")); }
-        toast(errText(e), "error");
       }
     }
   } finally { state.syncing = false; }
@@ -928,6 +956,11 @@ async function route() {
 /* ======================================================= UTILITIES ======= */
 function mount(node) { const root = appRoot(); root.textContent = ""; root.appendChild(node); }
 function scrollBottom(node) { requestAnimationFrame(() => { node.scrollTop = node.scrollHeight; }); }
+function applyViewportHeight() {
+  const vv = window.visualViewport;
+  const h = vv ? vv.height : window.innerHeight;
+  document.documentElement.style.setProperty("--app-height", Math.round(h) + "px");
+}
 function nearBottom(node) { return node.scrollHeight - node.scrollTop - node.clientHeight < 120; }
 function isMobile() { return matchMedia("(max-width: 640px)").matches; }
 
@@ -939,6 +972,15 @@ async function boot() {
 
   // theme
   applyTheme(await DB.getKV("theme") || "system");
+
+  // keep the app sized to the visible area so the keyboard doesn't hide the chat
+  applyViewportHeight();
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", () => { applyViewportHeight(); const t = $("#thread"); if (t) scrollBottom(t); });
+    window.visualViewport.addEventListener("scroll", applyViewportHeight);
+  }
+  window.addEventListener("resize", applyViewportHeight);
+  window.addEventListener("orientationchange", () => setTimeout(applyViewportHeight, 300));
 
   // restore session
   const token = await DB.getKV("token");
@@ -975,7 +1017,7 @@ async function boot() {
   await route();
   if (state.user && AppLock.isEnabled()) AppLock.lock();  // show decoy over the rendered app
   flushPending();
-  if (state.user) { refreshBadge(); state.badgeTimer = setInterval(refreshBadge, 15000); }
+  if (state.user) { refreshBadge(); state.badgeTimer = setInterval(refreshBadge, 20000); }
 }
 
 boot();
