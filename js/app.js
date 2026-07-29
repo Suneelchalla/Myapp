@@ -110,7 +110,9 @@ const state = {
   route: { name: "login", param: null },
   poll: { timer: null, presenceTick: 0 },
   activeConversation: null,   // { conversationId, otherUser, lastSequence, clearedBefore }
-  syncing: false
+  syncing: false,
+  unreadTotal: 0,
+  badgeTimer: null
 };
 
 /* --------------------------------------------------------------- SVG icons */
@@ -228,9 +230,9 @@ function shell(headerNode, contentNode, opts = {}) {
 }
 function navButton(iconName, label, href) {
   const active = location.hash.indexOf(href) === 0;
-  return el("a", { class: "navbtn" + (active ? " navbtn--active" : ""), href, "aria-current": active ? "page" : null }, [
-    icon(iconName), el("span", { class: "navbtn__label", text: label })
-  ]);
+  const children = [icon(iconName), el("span", { class: "navbtn__label", text: label })];
+  if (iconName === "chats" && state.unreadTotal > 0) children.push(el("span", { class: "nav-dot", "aria-label": "new messages" }));
+  return el("a", { class: "navbtn" + (active ? " navbtn--active" : ""), href, "aria-current": active ? "page" : null, dataset: { nav: iconName } }, children);
 }
 function topbar(title, opts = {}) {
   return el("header", { class: "topbar" }, [
@@ -274,8 +276,34 @@ async function refreshChatList(container) {
   try {
     const { conversations } = await call("listConversations", {});
     await DB.putConversations(conversations);
+    applyBadge(conversations.reduce((n, c) => n + (c.unreadCount || 0), 0));
     if (state.route.name === "chats") paintChatList(container, conversations);
   } catch (e) { if (!(e instanceof ApiError && e.code === "NETWORK")) toast(errText(e), "error"); }
+}
+
+// ---- unread badge (Chats tab dot + installed-icon badge) ----
+function applyBadge(total) {
+  state.unreadTotal = total || 0;
+  const chatsBtn = document.querySelector('.navbtn[data-nav="chats"]');
+  if (chatsBtn) {
+    let dot = chatsBtn.querySelector(".nav-dot");
+    if (state.unreadTotal > 0) { if (!dot) chatsBtn.appendChild(el("span", { class: "nav-dot", "aria-label": "new messages" })); }
+    else if (dot) dot.remove();
+  }
+  try {
+    if ("setAppBadge" in navigator) {
+      if (state.unreadTotal > 0) navigator.setAppBadge(state.unreadTotal).catch(() => {});
+      else navigator.clearAppBadge().catch(() => {});
+    }
+  } catch (e) { /* unsupported */ }
+}
+async function refreshBadge() {
+  if (!state.user || !getToken()) return;
+  try {
+    const { conversations } = await call("listConversations", {});
+    await DB.putConversations(conversations);
+    applyBadge(conversations.reduce((n, c) => n + (c.unreadCount || 0), 0));
+  } catch (e) { /* silent */ }
 }
 function paintChatList(container, conversations) {
   container.textContent = "";
@@ -502,7 +530,7 @@ async function refreshPresence() {
 let _readTimer = null;
 function markRead(conversationId, seq) {
   clearTimeout(_readTimer);
-  _readTimer = setTimeout(() => { call("markConversationRead", { conversationId, lastReadSequence: seq }).catch(() => {}); }, 600);
+  _readTimer = setTimeout(() => { call("markConversationRead", { conversationId, lastReadSequence: seq }).then(() => refreshBadge()).catch(() => {}); }, 600);
 }
 
 function paintThread(thread, messages) {
@@ -719,6 +747,8 @@ function openLockSetup(isChange) {
 
 async function logout() {
   try { await call("logout", {}); } catch (e) {}
+  if (state.badgeTimer) { clearInterval(state.badgeTimer); state.badgeTimer = null; }
+  applyBadge(0);
   await DB.clearAll();
   setToken(""); state.user = null;
   toast("Logged out", "success");
@@ -926,6 +956,7 @@ async function boot() {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) { if (state.user && AppLock.isEnabled()) AppLock.lock(); return; }
     if (state.poll.fn) state.poll.fn();
+    refreshBadge();
   });
   window.addEventListener("pagehide", () => { if (state.user && AppLock.isEnabled()) AppLock.lock(); });
 
@@ -944,6 +975,7 @@ async function boot() {
   await route();
   if (state.user && AppLock.isEnabled()) AppLock.lock();  // show decoy over the rendered app
   flushPending();
+  if (state.user) { refreshBadge(); state.badgeTimer = setInterval(refreshBadge, 15000); }
 }
 
 boot();
