@@ -3,7 +3,7 @@
 //  Paste your Google Apps Script Web App /exec URL between the quotes below.
 //  Example: "https://script.google.com/macros/s/AKfy...../exec"
 // =============================================================================
-export const API_URL = "PASTE_YOUR_WEB_APP_EXEC_URL_HERE";
+export const API_URL = "https://script.google.com/macros/s/AKfycbwVHL6nX4_HoetICPpX3AQEVTeBN_WvUezt3gRhNhobUNMjih5Pz5J-IuOoJzGZ_jP-SQ/exec";
 
 // Polling intervals (milliseconds) — safe defaults, no need to change.
 export const POLL = {
