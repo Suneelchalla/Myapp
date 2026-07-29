@@ -40,15 +40,20 @@ export async function call(action, payload = {}, opts = {}) {
   });
 
   let res;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000); // don't let a stuck request hang the app
   try {
     res = await fetch(API_URL, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
       body,
-      redirect: "follow"
+      redirect: "follow",
+      signal: controller.signal
     });
   } catch (netErr) {
     throw new ApiError("NETWORK", "You appear to be offline.");
+  } finally {
+    clearTimeout(timer);
   }
 
   let json;
