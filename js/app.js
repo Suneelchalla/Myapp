@@ -4,6 +4,7 @@
 import { POLL, APP_NAME, MESSAGE_MAX } from "./config.js";
 import { DB } from "./db.js";
 import { call, ApiError, setToken, getToken } from "./api.js";
+import { AppLock } from "./lock.js";
 
 /* ------------------------------------------------------------- tiny helpers */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -667,8 +668,41 @@ async function renderProfile() {
       ])]),
       el("div", { class: "card" }, [field("Display name", display), field("Bio", bio), saveBtn]),
       el("div", { class: "card" }, [el("h3", { class: "card__title", text: "Appearance" }), field("Theme", themeSel)]),
+      lockCard(),
       el("div", { class: "card" }, [logoutBtn])
     ])
+  ]);
+}
+
+function lockCard() {
+  const enabled = AppLock.isEnabled();
+  const rows = [el("h3", { class: "card__title", text: "Privacy" })];
+  if (enabled) {
+    rows.push(el("p", { class: "hint", text: "App lock is on. When you reopen the app you'll see a clock — tap the top-right corner, then enter your PIN." }));
+    rows.push(el("div", { class: "row__actions" }, [
+      el("button", { class: "btn btn--ghost btn--sm", text: "Change PIN", onclick: () => openLockSetup(true) }),
+      el("button", { class: "btn btn--danger btn--sm", text: "Turn off", onclick: async () => { await AppLock.disable(); toast("App lock turned off", "success"); renderProfile(); } })
+    ]));
+  } else {
+    rows.push(el("p", { class: "hint", text: "Hide the app behind a clock screen. Reopening shows a clock; tap the top-right corner to reveal a keypad and enter your PIN." }));
+    rows.push(el("button", { class: "btn btn--primary", text: "Turn on app lock", onclick: () => openLockSetup(false) }));
+  }
+  return el("div", { class: "card" }, rows);
+}
+
+function openLockSetup(isChange) {
+  const digits = (e) => { e.target.value = e.target.value.replace(/\D/g, ""); };
+  const pin = el("input", { class: "input", type: "password", inputmode: "numeric", maxlength: "6", placeholder: "4–6 digits", autocomplete: "off" });
+  const confirm = el("input", { class: "input", type: "password", inputmode: "numeric", maxlength: "6", placeholder: "re-enter PIN", autocomplete: "off" });
+  pin.addEventListener("input", digits); confirm.addEventListener("input", digits);
+  modal(isChange ? "Change PIN" : "Set a PIN", [field("New PIN", pin), field("Confirm PIN", confirm)], [
+    el("button", { class: "btn btn--ghost", text: "Cancel", onclick: closeOverlays }),
+    el("button", { class: "btn btn--primary", text: "Save", onclick: async () => {
+      const v = pin.value.trim();
+      if (v.length < 4 || v.length > 6) { toast("PIN must be 4–6 digits", "error"); return; }
+      if (v !== confirm.value.trim()) { toast("PINs don't match", "error"); return; }
+      await AppLock.setPin(v); closeOverlays(); toast("App lock is on", "success"); renderProfile();
+    } })
   ]);
 }
 
@@ -853,11 +887,19 @@ async function boot() {
   const user = await DB.getKV("user");
   if (token && user) { setToken(token); state.user = user; }
 
+  // app lock
+  await AppLock.load();
+  AppLock.init({ onLock: () => stopPolling(), onUnlock: () => route() });
+
   // listeners
   window.addEventListener("hashchange", route);
   window.addEventListener("online", () => { toast("Back online", "success"); flushPending(); if (state.poll.fn) state.poll.fn(); });
   window.addEventListener("offline", () => toast("You're offline", "info"));
-  document.addEventListener("visibilitychange", () => { if (!document.hidden && state.poll.fn) state.poll.fn(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { if (state.user && AppLock.isEnabled()) AppLock.lock(); return; }
+    if (state.poll.fn) state.poll.fn();
+  });
+  window.addEventListener("pagehide", () => { if (state.user && AppLock.isEnabled()) AppLock.lock(); });
 
   // service worker
   if ("serviceWorker" in navigator) {
@@ -871,7 +913,8 @@ async function boot() {
   }
 
   if (!location.hash) location.hash = state.user ? "#/chats" : "#/login";
-  route();
+  await route();
+  if (state.user && AppLock.isEnabled()) AppLock.lock();  // show decoy over the rendered app
   flushPending();
 }
 
