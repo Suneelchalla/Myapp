@@ -744,9 +744,23 @@ async function renderAdminLogin() {
     el("div", { class: "auth__footer" }, [el("a", { class: "link link--muted", href: "#/login", text: "← Back to app" })])));
 }
 
+function confirmDeleteUser(u) {
+  const confirmInput = el("input", { class: "input", placeholder: u.username, autocomplete: "off" });
+  modal("Delete @" + u.username + "?", [
+    el("p", { text: "This permanently deletes the account, all of its messages, and its chats. This cannot be undone." }),
+    field("Type the username to confirm", confirmInput)
+  ], [
+    el("button", { class: "btn btn--ghost", text: "Cancel", onclick: closeOverlays }),
+    el("button", { class: "btn btn--danger", text: "Delete permanently", onclick: async () => {
+      if (confirmInput.value.trim() !== u.username) { toast("Username doesn't match", "error"); return; }
+      try { await call("adminDeleteUser", { userId: u.userId }); closeOverlays(); toast("Account deleted", "success"); renderAdmin(); }
+      catch (e) { toast(errText(e), "error"); }
+    } })
+  ]);
+}
+
 async function renderAdmin() {
-  stopPolling();
-  const token = await DB.getKV("adminToken");
+  stopPolling();  const token = await DB.getKV("adminToken");
   if (!token) { location.hash = "#/admin/login"; return; }
   setToken(token);
   const header = el("header", { class: "topbar" }, [
@@ -790,9 +804,12 @@ async function renderAdmin() {
           el("span", { class: "row__name", text: u.displayName + (suspended ? " (suspended)" : "") }),
           el("span", { class: "row__preview", text: "@" + u.username })
         ]),
-        el("button", { class: "btn btn--sm " + (suspended ? "btn--primary" : "btn--ghost"), text: suspended ? "Reactivate" : "Suspend", onclick: async () => {
-          try { await call(suspended ? "adminReactivateUser" : "adminSuspendUser", { userId: u.userId, reason: "admin action" }); renderAdmin(); }
-          catch (e) { toast(errText(e), "error"); } } })
+        el("div", { class: "row__actions" }, [
+          el("button", { class: "btn btn--sm " + (suspended ? "btn--primary" : "btn--ghost"), text: suspended ? "Reactivate" : "Suspend", onclick: async () => {
+            try { await call(suspended ? "adminReactivateUser" : "adminSuspendUser", { userId: u.userId, reason: "admin action" }); renderAdmin(); }
+            catch (e) { toast(errText(e), "error"); } } }),
+          el("button", { class: "btn btn--sm btn--danger", text: "Delete", onclick: () => confirmDeleteUser(u) })
+        ])
       ]));
     });
   } catch (e) {
