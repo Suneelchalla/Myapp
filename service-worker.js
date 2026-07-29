@@ -2,7 +2,7 @@
 //  Ripple service worker — offline app shell.
 //  Bump CACHE_VERSION whenever you deploy new frontend files.
 // =============================================================================
-const CACHE_VERSION = "ripple-v2";
+const CACHE_VERSION = "ripple-v3";
 const SHELL = [
   "./",
   "./index.html",
@@ -12,6 +12,7 @@ const SHELL = [
   "./js/api.js",
   "./js/db.js",
   "./js/app.js",
+  "./js/lock.js",
   "./icons/icon-192.png",
   "./icons/icon-512.png",
   "./icons/favicon-32.png",
