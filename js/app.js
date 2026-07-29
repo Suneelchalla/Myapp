@@ -303,85 +303,96 @@ function paintChatList(container, conversations) {
 /* ======================================================= CONTACTS ========= */
 async function renderContacts() {
   stopPolling();
-  const search = el("input", { class: "input", type: "search", placeholder: "Search people by username", "aria-label": "Search people" });
+  const search = el("input", { class: "input", type: "search", placeholder: "Search people by name or username", "aria-label": "Search people" });
   const header = el("header", { class: "topbar topbar--stack" }, [
     el("h1", { class: "topbar__title", text: "Contacts" }),
     el("div", { class: "searchbar" }, [search])
   ]);
-  const results = el("div", { class: "list", id: "search-results" });
-  const requests = el("div", { class: "section", id: "requests" });
-  const contacts = el("div", { class: "section", id: "contacts" });
-  shell(header, [results, requests, contacts]);
+  const requestsBox = el("div", { class: "section", id: "requests" });
+  const peopleBox = el("div", { class: "section", id: "people" });
+  shell(header, [requestsBox, peopleBox]);
 
-  let debounce;
-  search.addEventListener("input", () => {
-    clearTimeout(debounce);
-    const q = search.value.trim();
-    if (q.length < 2) { results.textContent = ""; return; }
-    debounce = setTimeout(() => doSearch(q, results), 300);
-  });
+  peopleBox.appendChild(el("h3", { class: "section__title", text: "People" }));
+  peopleBox.appendChild(skeletonList(4));
 
-  await loadRequests(requests);
-  await loadContacts(contacts);
-  startPolling(POLL.CHAT_LIST, () => loadRequests(requests));
-}
-async function doSearch(q, results) {
-  try {
-    const { users } = await call("searchUsers", { query: q });
-    results.textContent = "";
-    if (!users.length) { results.appendChild(el("p", { class: "hint", text: "No users found." })); return; }
-    users.forEach((u) => {
-      const add = el("button", { class: "btn btn--sm btn--primary", text: "Add", onclick: async () => {
-        add.disabled = true;
-        try { await call("sendContactRequest", { receiverId: u.userId }); toast("Request sent", "success"); add.textContent = "Requested"; }
-        catch (e) { toast(errText(e), "error"); add.disabled = false; }
-      } });
-      results.appendChild(el("div", { class: "row row--compact" }, [
-        avatar(u, 44),
-        el("div", { class: "row__main" }, [el("span", { class: "row__name", text: u.displayName }), el("span", { class: "row__preview", text: "@" + u.username })]),
-        add
-      ]));
-    });
-  } catch (e) { toast(errText(e), "error"); }
-}
-async function loadRequests(node) {
-  try {
-    const { incoming } = await call("listContactRequests", {});
-    node.textContent = "";
+  let directory = [];
+  const rel = { contacts: new Set(), outgoing: new Set(), incoming: new Map() };
+
+  async function loadAll() {
+    try {
+      const [dir, cts, reqs] = await Promise.all([
+        call("listDirectory", {}),
+        call("listContacts", {}),
+        call("listContactRequests", {})
+      ]);
+      directory = dir.users || [];
+      rel.contacts = new Set((cts.contacts || []).map((u) => u.userId));
+      rel.outgoing = new Set((reqs.outgoing || []).map((r) => (r.receiver && r.receiver.userId) || r.receiverId));
+      rel.incoming = new Map((reqs.incoming || []).map((r) => [(r.requester && r.requester.userId) || r.requesterId, r.contactId]));
+      paintRequests(reqs.incoming || []);
+      paintPeople();
+    } catch (e) {
+      if (!(e instanceof ApiError && e.code === "NETWORK")) toast(errText(e), "error");
+    }
+  }
+
+  function paintRequests(incoming) {
+    requestsBox.textContent = "";
     if (!incoming.length) return;
-    node.appendChild(el("h3", { class: "section__title", text: "Requests" }));
+    requestsBox.appendChild(el("h3", { class: "section__title", text: "Requests" }));
     incoming.forEach((r) => {
-      const u = r.requester;
+      const u = r.requester || {};
       const accept = el("button", { class: "btn btn--sm btn--primary", text: "Accept", onclick: async () => {
-        try { await call("acceptContactRequest", { contactId: r.contactId }); toast("Contact added", "success"); renderContacts(); }
+        try { await call("acceptContactRequest", { contactId: r.contactId }); toast("Contact added", "success"); loadAll(); }
         catch (e) { toast(errText(e), "error"); } } });
       const reject = el("button", { class: "btn btn--sm btn--ghost", text: "Decline", onclick: async () => {
-        try { await call("rejectContactRequest", { contactId: r.contactId }); renderContacts(); }
+        try { await call("rejectContactRequest", { contactId: r.contactId }); loadAll(); }
         catch (e) { toast(errText(e), "error"); } } });
-      node.appendChild(el("div", { class: "row row--compact" }, [
+      requestsBox.appendChild(el("div", { class: "row row--compact" }, [
         avatar(u, 44),
         el("div", { class: "row__main" }, [el("span", { class: "row__name", text: u.displayName }), el("span", { class: "row__preview", text: "@" + u.username })]),
         el("div", { class: "row__actions" }, [accept, reject])
       ]));
     });
-  } catch (e) { /* silent on poll */ }
-}
-async function loadContacts(node) {
-  try {
-    const { contacts } = await call("listContacts", {});
-    node.textContent = "";
-    node.appendChild(el("h3", { class: "section__title", text: "Your contacts" }));
-    if (!contacts.length) { node.appendChild(emptyState("people", "No contacts yet", "Search above to find people and send a request.")); return; }
-    contacts.forEach((u) => {
-      node.appendChild(el("button", { class: "row row--button", onclick: () => startChat(u) }, [
-        avatar(u, 48),
+  }
+
+  function paintPeople() {
+    peopleBox.textContent = "";
+    peopleBox.appendChild(el("h3", { class: "section__title", text: "People" }));
+    const q = search.value.trim().toLowerCase();
+    const list = directory.filter((u) => !q || u.username.indexOf(q) !== -1 || String(u.displayName || "").toLowerCase().indexOf(q) !== -1);
+    if (!directory.length) { peopleBox.appendChild(emptyState("people", "No one else yet", "When other people sign up, they'll appear here to add.")); return; }
+    if (!list.length) { peopleBox.appendChild(el("p", { class: "hint", text: "No matches." })); return; }
+    list.forEach((u) => {
+      let btn;
+      if (rel.contacts.has(u.userId)) {
+        btn = el("button", { class: "btn btn--sm btn--ghost", text: "Message", onclick: () => startChat(u) });
+      } else if (rel.incoming.has(u.userId)) {
+        btn = el("button", { class: "btn btn--sm btn--primary", text: "Accept", onclick: async () => {
+          try { await call("acceptContactRequest", { contactId: rel.incoming.get(u.userId) }); toast("Contact added", "success"); loadAll(); }
+          catch (e) { toast(errText(e), "error"); } } });
+      } else if (rel.outgoing.has(u.userId)) {
+        btn = el("button", { class: "btn btn--sm btn--ghost", text: "Requested", disabled: "disabled" });
+      } else {
+        btn = el("button", { class: "btn btn--sm btn--primary", text: "Add", onclick: async (ev) => {
+          const b = ev.currentTarget; b.disabled = true;
+          try { await call("sendContactRequest", { receiverId: u.userId }); toast("Request sent", "success"); rel.outgoing.add(u.userId); paintPeople(); }
+          catch (e) { toast(errText(e), "error"); b.disabled = false; } } });
+      }
+      peopleBox.appendChild(el("div", { class: "row row--compact" }, [
+        avatar(u, 44),
         el("div", { class: "row__main" }, [
           el("span", { class: "row__name", text: u.displayName }),
           el("span", { class: "row__preview", text: u.online ? "online" : "@" + u.username })
-        ])
+        ]),
+        btn
       ]));
     });
-  } catch (e) { toast(errText(e), "error"); }
+  }
+
+  search.addEventListener("input", () => paintPeople());
+  await loadAll();
+  startPolling(POLL.CHAT_LIST, () => loadAll());
 }
 async function startChat(user) {
   try {
