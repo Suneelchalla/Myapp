@@ -5,12 +5,14 @@
 // =============================================================================
 export const API_URL = "https://script.google.com/macros/s/AKfycbwVHL6nX4_HoetICPpX3AQEVTeBN_WvUezt3gRhNhobUNMjih5Pz5J-IuOoJzGZ_jP-SQ/exec";
 
-// Polling intervals (milliseconds) — open-chat is aggressive so messages feel live.
+// Polling — Apps Script is slow; aggressive polling stacks requests and lags the whole app.
 export const POLL = {
-  OPEN_CONVERSATION: 800,    // active chat open (was 2000 — felt laggy behind GAS latency)
-  CHAT_LIST: 5000,           // chat list / contacts screen
-  HIDDEN_TAB: 20000,         // browser tab hidden / inactive
-  CATCH_UP: 200              // re-poll quickly after new messages arrive
+  OPEN_CONVERSATION: 3500,   // open chat (was 800 — flooded GAS)
+  CHAT_LIST: 12000,          // chats tab
+  CONTACTS: 30000,           // contacts tab
+  BADGE: 30000,              // app badge while elsewhere
+  HIDDEN_TAB: 45000,         // tab / app backgrounded
+  CATCH_UP: 1500             // after new messages arrive (min gap)
 };
 
 export const APP_NAME = "Clocker";
