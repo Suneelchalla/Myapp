@@ -10,22 +10,35 @@ export const Vault = {
     return !!(await DB.getKV("vault"));
   },
 
-  /** Snapshot sensitive data → encrypted vault, then wipe plaintext copies. */
-  async seal(key) {
-    if (!key) throw new Error("NO_KEY");
-    const payload = {
+  async _snapshot() {
+    return {
+      v: 2,
+      sealedAt: Date.now(),
       token: await DB.getKV("token"),
       user: await DB.getKV("user"),
       conversations: await DB.getConversations(),
       messages: await DB.getAllMessages(),
-      pending: await DB.getPending()
+      pending: await DB.getPending(),
+      contactsCache: await DB.getKV("contactsCache")
     };
-    // Only seal if there is something worth protecting
-    if (payload.token || payload.user || (payload.messages && payload.messages.length) ||
-        (payload.conversations && payload.conversations.length) || (payload.pending && payload.pending.length)) {
-      const blob = await encryptJson(key, payload);
-      await DB.setKV("vault", blob);
+  },
+
+  /** Write encrypted backup without wiping (keeps session usable while unlocked). */
+  async backup(key) {
+    if (!key) throw new Error("NO_KEY");
+    const payload = await this._snapshot();
+    if (!(payload.token || payload.user || (payload.messages && payload.messages.length) ||
+        (payload.conversations && payload.conversations.length) || (payload.pending && payload.pending.length))) {
+      return false;
     }
+    await DB.setKV("vault", await encryptJson(key, payload));
+    return true;
+  },
+
+  /** Snapshot sensitive data → encrypted vault, then wipe plaintext copies. */
+  async seal(key) {
+    if (!key) throw new Error("NO_KEY");
+    await this.backup(key);
     await this.wipePlaintextSensitive();
   },
 
@@ -38,9 +51,9 @@ export const Vault = {
     await this.wipePlaintextSensitive();
     if (payload.token) await DB.setKV("token", payload.token);
     if (payload.user) await DB.setKV("user", payload.user);
+    if (payload.contactsCache) await DB.setKV("contactsCache", payload.contactsCache);
     if (payload.conversations && payload.conversations.length) await DB.putConversations(payload.conversations);
     if (payload.messages && payload.messages.length) {
-      // Group by conversation for putMessages
       const by = {};
       for (const m of payload.messages) {
         const id = m.conversationId;
@@ -63,21 +76,20 @@ export const Vault = {
     await DB.clearStore("pending");
     await DB.delKV("token");
     await DB.delKV("user");
+    await DB.delKV("contactsCache");
+    await DB.delKV("adminToken");
   },
 
   /** Boot safety: if lock is on, never leave plaintext session on disk. */
   async hardenForLockedBoot() {
-    const token = await DB.getKV("token");
-    const user = await DB.getKV("user");
     const hasVault = await this.hasVault();
     if (hasVault) {
-      // Prefer vault — drop any leftover plaintext
       await this.wipePlaintextSensitive();
       return "vault";
     }
+    const token = await DB.getKV("token");
+    const user = await DB.getKV("user");
     if (token || user) {
-      // Lock enabled but never sealed (upgrade / crash) — drop plaintext;
-      // user must sign in again after unlock if vault is missing.
       await this.wipePlaintextSensitive();
       return "wiped";
     }
