@@ -26,7 +26,7 @@ export function b64ToBytes(b64) {
 }
 
 /** Derive an AES-GCM key from the unlock time (PIN) + salt. */
-export async function deriveKey(pin, saltBytes, iterations = 100000) {
+export async function deriveKey(pin, saltBytes, iterations = 60000) {
   const base = await crypto.subtle.importKey("raw", te.encode(String(pin)), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
     { name: "PBKDF2", salt: saltBytes, iterations, hash: "SHA-256" },
