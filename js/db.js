@@ -71,13 +71,25 @@ export const DB = {
     const keys = await done(idx.getAllKeys(IDBKeyRange.only(conversationId)));
     await Promise.all(keys.map((k) => done(s.delete(k))));
   },
+  async getAllMessages() {
+    const s = await tx("messages", "readonly");
+    return done(s.getAll());
+  },
 
   // pending queue
   async addPending(item) { const s = await tx("pending", "readwrite"); return done(s.put(item)); },
   async getPending() { const s = await tx("pending", "readonly"); return done(s.getAll()); },
   async removePending(clientMessageId) { const s = await tx("pending", "readwrite"); return done(s.delete(clientMessageId)); },
 
-  // wipe everything (logout)
+  async clearStore(name) {
+    const db = await open();
+    return new Promise((res) => {
+      const r = db.transaction(name, "readwrite").objectStore(name).clear();
+      r.onsuccess = res; r.onerror = res;
+    });
+  },
+
+  // wipe everything (logout) — keep nothing
   async clearAll() {
     const db = await open();
     await Promise.all(["kv", "conversations", "messages", "pending"].map((name) =>
