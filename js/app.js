@@ -119,7 +119,9 @@ const state = {
   activeConversation: null,   // { conversationId, otherUser, lastSequence, clearedBefore }
   syncing: false,
   unreadTotal: 0,
-  badgeTimer: null
+  badgeTimer: null,
+  // In-memory tab caches — avoid IDB + GAS on every Chats/Contacts tap
+  mem: { conversations: null, conversationsAt: 0, contacts: null, contactsAt: 0 }
 };
 
 /* --------------------------------------------------------------- SVG icons */
@@ -166,6 +168,9 @@ function field(labelText, input) {
 }
 
 function renderLogin() {
+  // Wake Apps Script while the user types — cuts cold-start wait on Sign in
+  call("ping", {}).catch(() => {});
+
   const username = el("input", { class: "input", type: "text", autocomplete: "username", placeholder: "your username" });
   const password = el("input", { class: "input", type: "password", autocomplete: "current-password", placeholder: "••••••••" });
   const submit = el("button", { class: "btn btn--primary btn--block", text: "Sign in" });
@@ -176,13 +181,13 @@ function renderLogin() {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         if (attempt > 0) { submit.textContent = "Retrying…"; toast("Waking server…", "info"); }
+        else toast("Connecting… first wake can take up to a minute", "info");
         const data = await call("login", { username: username.value, password: password.value, deviceId: state.deviceId });
         await afterAuth(data);
         lastErr = null;
         break;
       } catch (e) {
         lastErr = e;
-        // One automatic retry — Apps Script cold start is common on Android
         if (!(e instanceof ApiError) || !["TIMEOUT", "NETWORK"].includes(e.code) || attempt === 1) break;
       }
     }
@@ -293,23 +298,62 @@ function renderRegister() {
 async function afterAuth(data) {
   setToken(data.token);
   state.user = data.user;
-  await DB.setKV("token", data.token);
-  await DB.setKV("user", data.user);
-  // Vault refresh is deferred to lock — seal+unseal here froze Android after login
+  state.mem = { conversations: null, conversationsAt: 0, contacts: null, contactsAt: 0 };
+  // Navigate immediately — don't wait on IndexedDB before the chats tab paints
   toast("Signed in", "success");
   location.hash = "#/chats";
+  DB.setKV("token", data.token).catch(() => {});
+  DB.setKV("user", data.user).catch(() => {});
   flushPending();
 }
 
 /* ======================================================= APP SHELL ======== */
 function shell(headerNode, contentNode, opts = {}) {
-  const tabs = opts.hideNav ? null : el("nav", { class: "bottomnav", "aria-label": "Primary" }, [
+  const hideNav = !!opts.hideNav;
+  const root = appRoot();
+  let shellEl = root.querySelector(":scope > .shell");
+  const hasNav = !!(shellEl && shellEl.querySelector(".bottomnav"));
+
+  // Reuse shell when staying in main tabs (huge win on Android tab switches)
+  if (shellEl && hasNav === !hideNav) {
+    const content = shellEl.querySelector("#content");
+    const oldHeader = shellEl.querySelector(":scope > .topbar, :scope > header");
+    if (oldHeader) oldHeader.replaceWith(headerNode);
+    else shellEl.insertBefore(headerNode, content || shellEl.firstChild);
+    if (content) {
+      content.textContent = "";
+      const nodes = Array.isArray(contentNode) ? contentNode : [contentNode];
+      nodes.filter(Boolean).forEach((n) => content.appendChild(n));
+    }
+    if (!hideNav) syncBottomNav();
+    return shellEl;
+  }
+
+  const tabs = hideNav ? null : el("nav", { class: "bottomnav", "aria-label": "Primary" }, [
     navButton("chats", "Chats", "#/chats"),
     navButton("people", "Contacts", "#/contacts"),
     navButton("user", "Profile", "#/profile")
   ]);
   mount(el("div", { class: "shell" }, [headerNode, el("main", { class: "content", id: "content" }, contentNode), tabs].filter(Boolean)));
+  return root.querySelector(":scope > .shell");
 }
+
+function syncBottomNav() {
+  document.querySelectorAll(".bottomnav .navbtn").forEach((a) => {
+    const href = a.getAttribute("href") || "";
+    const active = location.hash.indexOf(href) === 0;
+    a.classList.toggle("navbtn--active", active);
+    if (active) a.setAttribute("aria-current", "page");
+    else a.removeAttribute("aria-current");
+    if (a.dataset.nav === "chats") {
+      let dot = a.querySelector(".nav-dot");
+      if (state.unreadTotal > 0) {
+        if (!dot) a.appendChild(el("span", { class: "nav-dot", "aria-label": "new messages" }));
+      } else if (dot) dot.remove();
+    }
+  });
+}
+
 function navButton(iconName, label, href) {
   const active = location.hash.indexOf(href) === 0;
   const children = [icon(iconName), el("span", { class: "navbtn__label", text: label })];
@@ -347,21 +391,39 @@ async function renderChatList() {
   const container = el("div", { class: "list", id: "chatlist" });
   shell(header, [container]);
 
-  const cached = await DB.getConversations();
-  if (cached.length) paintChatList(container, cached);
-  else container.appendChild(skeletonList());
+  // Paint from memory first (instant tab switch), then IDB, then network if stale
+  if (state.mem.conversations) {
+    paintChatList(container, state.mem.conversations);
+  } else {
+    const cached = await DB.getConversations();
+    if (cached.length) {
+      state.mem.conversations = cached;
+      paintChatList(container, cached);
+    } else {
+      container.appendChild(emptyState("chats", "No conversations yet", "Head to Contacts to add someone, then start chatting."));
+    }
+  }
 
-  // Don't block the tab on a slow Apps Script round-trip
-  refreshChatList(container);
+  const stale = Date.now() - (state.mem.conversationsAt || 0) > POLL.TAB_CACHE_MS;
+  if (stale) {
+    // Yield to the browser so the tab paints before the slow GAS call
+    requestAnimationFrame(() => refreshChatList(container));
+  }
   startPolling(POLL.CHAT_LIST, () => refreshChatList(container));
 }
 async function refreshChatList(container) {
+  if (!container.isConnected) return;
   try {
     const { conversations } = await call("listConversations", {});
+    state.mem.conversations = conversations;
+    state.mem.conversationsAt = Date.now();
     await DB.putConversations(conversations);
     applyBadge(conversations.reduce((n, c) => n + (c.unreadCount || 0), 0));
-    if (state.route.name === "chats") paintChatList(container, conversations);
-  } catch (e) { if (!(e instanceof ApiError && e.code === "NETWORK")) toast(errText(e), "error"); }
+    if (state.route.name === "chats" && container.isConnected) paintChatList(container, conversations);
+  } catch (e) {
+    if (isSessionDead(e)) forceReLogin(e);
+    else if (!(e instanceof ApiError && (e.code === "NETWORK" || e.code === "TIMEOUT"))) toast(errText(e), "error");
+  }
 }
 
 // ---- unread badge (Chats tab dot + installed-icon badge) ----
@@ -430,9 +492,6 @@ async function renderContacts() {
   const peopleBox = el("div", { class: "section", id: "people" });
   shell(header, [requestsBox, peopleBox]);
 
-  peopleBox.appendChild(el("h3", { class: "section__title", text: "People" }));
-  peopleBox.appendChild(skeletonList(4));
-
   let directory = [];
   const rel = { contacts: new Set(), outgoing: new Map(), incoming: new Map() };
 
@@ -449,7 +508,6 @@ async function renderContacts() {
     try {
       let data;
       try {
-        // Prefer one round-trip (new backend). Fall back if not redeployed yet.
         data = await call("contactsHome", {});
       } catch (e) {
         if (!(e instanceof ApiError) || e.code === "NETWORK" || e.code === "TIMEOUT") throw e;
@@ -465,8 +523,10 @@ async function renderContacts() {
           outgoing: (reqs.outgoing || [])
         };
       }
+      state.mem.contacts = data;
+      state.mem.contactsAt = Date.now();
       await DB.setKV("contactsCache", data);
-      applyPayload(data);
+      if (state.route.name === "contacts") applyPayload(data);
     } catch (e) {
       if (isSessionDead(e)) { forceReLogin(e); return; }
       if (!silent && !(e instanceof ApiError && (e.code === "NETWORK" || e.code === "TIMEOUT"))) toast(errText(e), "error");
@@ -544,10 +604,20 @@ async function renderContacts() {
 
   search.addEventListener("input", () => paintPeople());
 
-  // Instant paint from cache, then refresh in background
-  const cached = await DB.getKV("contactsCache");
-  if (cached && (cached.users || cached.contacts)) applyPayload(cached);
-  loadAll();
+  // Instant paint from memory / IndexedDB — network only if cache is stale
+  if (state.mem.contacts) {
+    applyPayload(state.mem.contacts);
+  } else {
+    peopleBox.appendChild(el("h3", { class: "section__title", text: "People" }));
+    peopleBox.appendChild(skeletonList(4));
+    const cached = await DB.getKV("contactsCache");
+    if (cached && (cached.users || cached.contacts)) {
+      state.mem.contacts = cached;
+      applyPayload(cached);
+    }
+  }
+  const stale = Date.now() - (state.mem.contactsAt || 0) > POLL.TAB_CACHE_MS;
+  if (stale) requestAnimationFrame(() => loadAll(!!state.mem.contacts));
   startPolling(POLL.CONTACTS, () => loadAll(true));
 }
 async function startChat(user) {
@@ -912,7 +982,7 @@ async function renderProfile() {
   stopPolling();
   const u = state.user;
   const header = topbar("Profile");
-  const theme = await DB.getKV("theme") || "system";
+  const theme = state.theme || "system";
 
   const display = el("input", { class: "input", type: "text", value: u.displayName || "" });
   const bio = el("textarea", { class: "input input--area", rows: "3", maxlength: "200" }); bio.value = u.bio || "";
@@ -924,7 +994,11 @@ async function renderProfile() {
     } catch (e) { toast(errText(e), "error"); } finally { saveBtn.disabled = false; }
   } });
 
-  const themeSel = el("select", { class: "input", onchange: async (e) => { await DB.setKV("theme", e.target.value); applyTheme(e.target.value); } },
+  const themeSel = el("select", { class: "input", onchange: async (e) => {
+    state.theme = e.target.value;
+    await DB.setKV("theme", e.target.value);
+    applyTheme(e.target.value);
+  } },
     [["system", "Match system"], ["light", "Light"], ["dark", "Dark"]].map(([v, l]) => el("option", { value: v, text: l, selected: v === theme ? "selected" : null })));
 
   const logoutBtn = el("button", { class: "btn btn--danger btn--block", text: "Log out", onclick: logout });
@@ -1094,6 +1168,7 @@ async function logout() {
   AppLock.clearKey();
   await AppLock.load();
   setToken(""); state.user = null;
+  state.mem = { conversations: null, conversationsAt: 0, contacts: null, contactsAt: 0 };
   document.body.classList.remove("is-locked");
   toast("Logged out", "success");
   location.hash = "#/login";
@@ -1300,7 +1375,11 @@ async function route() {
   const needsAuth = ["chats", "contacts", "profile", "conversation"].includes(r.name);
   if (needsAuth && !state.user) { location.hash = "#/login"; return; }
   if (state.user && ["login", "register", "forgot"].includes(r.name)) { location.hash = "#/chats"; return; }
-  if (r.name !== "admin" && r.name !== "adminLogin" && state.user) setToken(await DB.getKV("token"));
+  // Token is kept in memory — only hit IndexedDB if somehow missing
+  if (r.name !== "admin" && r.name !== "adminLogin" && state.user && !getToken()) {
+    const t = await DB.getKV("token");
+    if (t) setToken(t);
+  }
 
   switch (r.name) {
     case "login": return renderLogin();
@@ -1337,6 +1416,7 @@ async function secureLockUI() {
   state.user = null;
   state.activeConversation = null;
   state.unreadTotal = 0;
+  state.mem = { conversations: null, conversationsAt: 0, contacts: null, contactsAt: 0 };
   state.poll.fn = null;
   const root = appRoot();
   if (root) root.textContent = "";
@@ -1401,7 +1481,8 @@ async function boot() {
   if (!state.deviceId) { state.deviceId = "dev_" + uuid(); await DB.setKV("deviceId", state.deviceId); }
 
   // theme
-  applyTheme(await DB.getKV("theme") || "system");
+  state.theme = await DB.getKV("theme") || "system";
+  applyTheme(state.theme);
 
   // keep the app sized to the visible area so the keyboard doesn't hide the chat
   applyViewportHeight();
