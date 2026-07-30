@@ -43,11 +43,16 @@ function enqueue(fn) {
  * Call a backend action.
  * @param {string} action
  * @param {object} payload
- * @param {object} [opts] { token }  override token (e.g. admin)
+ * @param {object} [opts] { token, timeoutMs }
  */
 export async function call(action, payload = {}, opts = {}) {
   if (!API_URL || API_URL.indexOf("PASTE_YOUR") === 0) {
     throw new ApiError("NOT_CONFIGURED", "The app is not connected yet. Set API_URL in js/config.js.");
+  }
+
+  // Ping wakes the script — short timeout, still queued so login follows a warm server
+  if (action === "ping") {
+    return enqueue(() => doFetch(action, payload, { ...opts, timeoutMs: 12000 }));
   }
 
   const coalesce = COALESCE.has(action);
@@ -74,7 +79,7 @@ async function doFetch(action, payload, opts) {
 
   let res;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), GAS_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs || GAS_TIMEOUT_MS);
   try {
     res = await fetch(API_URL, {
       method: "POST",
