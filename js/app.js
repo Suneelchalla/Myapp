@@ -4,7 +4,8 @@
 import { POLL, APP_NAME, MESSAGE_MAX } from "./config.js";
 import { DB } from "./db.js";
 import { call, ApiError, setToken, getToken } from "./api.js";
-import { AppLock } from "./lock.js";
+import { AppLock, normalizeTimePin, formatTimePin } from "./lock.js";
+import { Vault } from "./vault.js";
 
 /* ------------------------------------------------------------- tiny helpers */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -141,7 +142,7 @@ function avatar(user, size) {
 function authShell(titleText, subtitleText, formNode, footerNode) {
   return el("div", { class: "auth" }, [
     el("div", { class: "auth__brand" }, [
-      el("div", { class: "brand-mark", html: ICON.chats }),
+      el("div", { class: "brand-mark", html: ICON.clock }),
       el("h1", { class: "brand-name", text: APP_NAME })
     ]),
     el("div", { class: "auth__card glass" }, [
@@ -214,6 +215,15 @@ async function afterAuth(data) {
   state.user = data.user;
   await DB.setKV("token", data.token);
   await DB.setKV("user", data.user);
+  // Refresh encrypted backup while lock is on (mobile force-kill safety)
+  if (AppLock.isEnabled() && AppLock.getKey()) {
+    try {
+      await Vault.seal(AppLock.getKey());
+      await Vault.unseal(AppLock.getKey());
+      setToken(data.token);
+      state.user = data.user;
+    } catch (e) {}
+  }
   toast("Signed in", "success");
   location.hash = "#/chats";
   flushPending();
@@ -500,7 +510,8 @@ async function renderConversation(conversationId) {
 async function pollConversation(thread, first) {
   const ac = state.activeConversation;
   if (!ac) return;
-  await flushPending();
+  // Never block inbound fetch on outbound send — run flush in parallel
+  flushPending().catch(() => {});
   try {
     const { messages, readUpTo } = await call("getMessages", { conversationId: ac.conversationId, afterSequence: ac.lastSequence });
     if (messages.length) {
@@ -510,11 +521,13 @@ async function pollConversation(thread, first) {
       ac.lastSequence = Math.max(ac.lastSequence, ...messages.map((m) => m.sequenceNumber || 0));
       if (wasBottom || first) scrollBottom(thread);
       markRead(ac.conversationId, ac.lastSequence);
+      // More may be in flight — pull again almost immediately
+      state.poll.burst = true;
     }
     if (readUpTo != null && readUpTo > ac.readUpTo) { ac.readUpTo = readUpTo; markReadTicks(readUpTo); }
   } catch (e) { /* transient GAS hiccup: stay quiet, next poll retries */ }
 
-  // refresh presence every ~5 ticks
+  // refresh presence every ~5 ticks (non-blocking)
   state.poll.presenceTick = (state.poll.presenceTick + 1) % 8;
   if (first || state.poll.presenceTick === 0) refreshPresence();
 }
@@ -657,27 +670,58 @@ async function refreshThreadNow() {
 }
 
 function convMenu(conversationId) {
-  sheet([
-    { label: "Clear chat (this device)", onClick: () => clearChat(conversationId) },
-    { label: "Report user", danger: true, onClick: () => {
+  const items = [];
+  // Only offer Clear when this thread actually has messages (or pending sends)
+  if (threadHasMessages(conversationId)) {
+    items.push({ label: "Clear chat (this device)", onClick: () => clearChat(conversationId) });
+  }
+  items.push({
+    label: "Report user", danger: true, onClick: () => {
       const other = state.activeConversation?.otherUser;
       if (other?.userId) reportDialog("Report user", async (reason, details) => { await call("reportUser", { reportedUserId: other.userId, reason, details }); });
-    } }
-  ]);
+    }
+  });
+  sheet(items);
 }
+
+/** True if the open thread (or local cache) still has something to clear. */
+function threadHasMessages(conversationId) {
+  const thread = $("#thread");
+  if (thread && thread.querySelector(".bubble")) return true;
+  // Fallback for race before paint: check in-memory active cursor
+  const ac = state.activeConversation;
+  if (ac && ac.conversationId === conversationId && ac.lastSequence > (ac.clearedBefore || 0)) return true;
+  return false;
+}
+
 function clearChat(conversationId) {
+  if (!threadHasMessages(conversationId)) return;
+  let busy = false;
+  const clearBtn = el("button", { class: "btn btn--danger", text: "Clear", onclick: async () => {
+    if (busy) return;
+    busy = true;
+    clearBtn.disabled = true;
+    clearBtn.textContent = "Clearing…";
+    try {
+      const { clearedBeforeSequence } = await call("clearConversation", { conversationId });
+      await DB.clearMessages(conversationId);
+      if (state.activeConversation) {
+        state.activeConversation.clearedBefore = clearedBeforeSequence;
+        state.activeConversation.lastSequence = clearedBeforeSequence;
+      }
+      closeOverlays();
+      const thread = $("#thread"); if (thread) thread.textContent = "";
+      toast("Chat cleared", "success");
+    } catch (e) {
+      busy = false;
+      clearBtn.disabled = false;
+      clearBtn.textContent = "Clear";
+      toast(errText(e), "error");
+    }
+  }});
   modal("Clear this chat?", [el("p", { text: "Messages will be removed from this device. Your contact keeps their copy." })], [
     el("button", { class: "btn btn--ghost", text: "Cancel", onclick: closeOverlays }),
-    el("button", { class: "btn btn--danger", text: "Clear", onclick: async () => {
-      try {
-        const { clearedBeforeSequence } = await call("clearConversation", { conversationId });
-        await DB.clearMessages(conversationId);
-        if (state.activeConversation) { state.activeConversation.clearedBefore = clearedBeforeSequence; state.activeConversation.lastSequence = clearedBeforeSequence; }
-        closeOverlays();
-        const thread = $("#thread"); if (thread) thread.textContent = "";
-        toast("Chat cleared", "success");
-      } catch (e) { toast(errText(e), "error"); }
-    } })
+    clearBtn
   ]);
 }
 
@@ -741,30 +785,61 @@ function lockCard() {
   const enabled = AppLock.isEnabled();
   const rows = [el("h3", { class: "card__title", text: "Privacy" })];
   if (enabled) {
-    rows.push(el("p", { class: "hint", text: "App lock is on. When you reopen the app you'll see a clock — tap the top-right corner, then enter your PIN." }));
+    rows.push(el("p", { class: "hint", text: "App lock is on. On Android: long-press (or double-tap) the clock time, then enter your unlock time. Leaving the app seals chats." }));
     rows.push(el("div", { class: "row__actions" }, [
-      el("button", { class: "btn btn--ghost btn--sm", text: "Change PIN", onclick: () => openLockSetup(true) }),
-      el("button", { class: "btn btn--danger btn--sm", text: "Turn off", onclick: async () => { await AppLock.disable(); toast("App lock turned off", "success"); renderProfile(); } })
+      el("button", { class: "btn btn--ghost btn--sm", text: "Change time", onclick: () => openLockSetup(true) }),
+      el("button", { class: "btn btn--danger btn--sm", text: "Turn off", onclick: async () => {
+        await AppLock.disable();
+        toast("App lock turned off", "success");
+        renderProfile();
+      } })
     ]));
   } else {
-    rows.push(el("p", { class: "hint", text: "Hide the app behind a clock screen. Reopening shows a clock; tap the top-right corner to reveal a keypad and enter your PIN." }));
+    rows.push(el("p", { class: "hint", text: "Hide chats behind a clock. Your unlock time also encrypts messages on this device while locked." }));
     rows.push(el("button", { class: "btn btn--primary", text: "Turn on app lock", onclick: () => openLockSetup(false) }));
   }
   return el("div", { class: "card" }, rows);
 }
 
+function timeField(labelText, placeholder) {
+  const input = el("input", {
+    class: "input", type: "text", inputmode: "numeric", maxlength: "5",
+    placeholder: placeholder || "11:30", autocomplete: "off", "aria-label": labelText
+  });
+  input.addEventListener("input", () => {
+    let d = input.value.replace(/\D/g, "").slice(0, 4);
+    if (d.length > 2) d = d.slice(0, 2) + ":" + d.slice(2);
+    input.value = d;
+  });
+  return { wrap: field(labelText, input), input };
+}
+
 function openLockSetup(isChange) {
-  const digits = (e) => { e.target.value = e.target.value.replace(/\D/g, ""); };
-  const pin = el("input", { class: "input", type: "password", inputmode: "numeric", maxlength: "6", placeholder: "4–6 digits", autocomplete: "off" });
-  const confirm = el("input", { class: "input", type: "password", inputmode: "numeric", maxlength: "6", placeholder: "re-enter PIN", autocomplete: "off" });
-  pin.addEventListener("input", digits); confirm.addEventListener("input", digits);
-  modal(isChange ? "Change PIN" : "Set a PIN", [field("New PIN", pin), field("Confirm PIN", confirm)], [
+  const chat = timeField("Messages unlock time", "11:30");
+  modal(isChange ? "Change unlock time" : "Set unlock time", [
+    el("p", { class: "hint", text: "Use a clock time (e.g. 11:30). This unlocks chats and encrypts local data while the clock is showing." }),
+    chat.wrap
+  ], [
     el("button", { class: "btn btn--ghost", text: "Cancel", onclick: closeOverlays }),
     el("button", { class: "btn btn--primary", text: "Save", onclick: async () => {
-      const v = pin.value.trim();
-      if (v.length < 4 || v.length > 6) { toast("PIN must be 4–6 digits", "error"); return; }
-      if (v !== confirm.value.trim()) { toast("PINs don't match", "error"); return; }
-      await AppLock.setPin(v); closeOverlays(); toast("App lock is on", "success"); renderProfile();
+      const c = normalizeTimePin(chat.input.value);
+      if (!c) { toast("Enter a valid time like 11:30", "error"); return; }
+      try {
+        await AppLock.setPin(c);
+        // Seal then restore so disk is encrypted-capable with the new key, session stays usable
+        const key = AppLock.getKey();
+        if (key) {
+          await Vault.seal(key);
+          await Vault.unseal(key);
+          const token = await DB.getKV("token");
+          const user = await DB.getKV("user");
+          if (token) setToken(token);
+          if (user) state.user = user;
+        }
+        closeOverlays();
+        toast("App lock is on — unlock at " + formatTimePin(c), "success");
+        renderProfile();
+      } catch (e) { toast(e.message || "Could not save", "error"); }
     } })
   ]);
 }
@@ -773,8 +848,21 @@ async function logout() {
   try { await call("logout", {}); } catch (e) {}
   if (state.badgeTimer) { clearInterval(state.badgeTimer); state.badgeTimer = null; }
   applyBadge(0);
+  stopPolling();
+  const keep = {
+    deviceId: await DB.getKV("deviceId"),
+    theme: await DB.getKV("theme"),
+    lock: await DB.getKV("lock"),
+    decoyAlarms: await DB.getKV("decoyAlarms")
+  };
   await DB.clearAll();
+  for (const [k, v] of Object.entries(keep)) {
+    if (v != null) await DB.setKV(k, v);
+  }
+  AppLock.clearKey();
+  await AppLock.load();
   setToken(""); state.user = null;
+  document.body.classList.remove("is-locked");
   toast("Logged out", "success");
   location.hash = "#/login";
 }
@@ -877,8 +965,18 @@ function startPolling(interval, fn) {
   stopPolling();
   state.poll.fn = fn;
   state.poll.base = interval;
-  const run = () => { const iv = document.hidden ? POLL.HIDDEN_TAB : interval; state.poll.timer = setTimeout(async () => { await fn(); run(); }, iv); };
-  run();
+  state.poll.burst = false;
+  const schedule = (delay) => { state.poll.timer = setTimeout(tick, delay); };
+  const tick = async () => {
+    const started = Date.now();
+    await fn();
+    let next;
+    if (document.hidden) next = POLL.HIDDEN_TAB;
+    else if (state.poll.burst) { next = POLL.CATCH_UP; state.poll.burst = false; }
+    else next = Math.max(0, interval - (Date.now() - started)); // don't add full wait on top of slow GAS
+    schedule(next);
+  };
+  schedule(interval);
 }
 function stopPolling() { if (state.poll.timer) { clearTimeout(state.poll.timer); state.poll.timer = null; } state.poll.fn = null; }
 
@@ -933,6 +1031,7 @@ function parseHash() {
 }
 
 async function route() {
+  if (AppLock.isLocked()) return; // clock cover — no chat UI underneath
   closeOverlays();
   const r = parseHash();
   state.route = r;
@@ -965,6 +1064,58 @@ function nearBottom(node) { return node.scrollHeight - node.scrollTop - node.cli
 function isMobile() { return matchMedia("(max-width: 640px)").matches; }
 
 /* ======================================================= BOOT ============ */
+async function secureLockTearDown() {
+  stopPolling();
+  if (state.badgeTimer) { clearInterval(state.badgeTimer); state.badgeTimer = null; }
+  applyBadge(0);
+  closeOverlays();
+  const key = AppLock.getKey();
+  if (key) {
+    try { await Vault.seal(key); } catch (e) { /* still tear down UI */ }
+  } else {
+    // No in-memory key (e.g. page restored) — wipe plaintext so diggers find nothing
+    try { await Vault.wipePlaintextSensitive(); } catch (e) {}
+  }
+  setToken("");
+  state.user = null;
+  state.activeConversation = null;
+  state.unreadTotal = 0;
+  state.poll.fn = null;
+  const root = appRoot();
+  if (root) root.textContent = "";
+}
+
+async function secureUnlock(pin) {
+  await AppLock.unlockKey(pin);
+  const key = AppLock.getKey();
+  let payload = null;
+  try {
+    payload = await Vault.unseal(key);
+  } catch (e) {
+    AppLock.clearKey();
+    throw e;
+  }
+  const token = (payload && payload.token) || (await DB.getKV("token"));
+  const user = (payload && payload.user) || (await DB.getKV("user"));
+  if (token && user) {
+    setToken(token);
+    state.user = user;
+    location.hash = "#/chats";
+    await route();
+    flushPending();
+    refreshBadge();
+    if (state.badgeTimer) clearInterval(state.badgeTimer);
+    state.badgeTimer = setInterval(refreshBadge, 8000);
+  } else {
+    // Vault missing / wiped on upgrade — unlock succeeded but need to sign in again
+    setToken("");
+    state.user = null;
+    location.hash = "#/login";
+    await route();
+    toast("Enter your account to continue", "info");
+  }
+}
+
 async function boot() {
   // device id
   state.deviceId = await DB.getKV("deviceId");
@@ -982,42 +1133,82 @@ async function boot() {
   window.addEventListener("resize", applyViewportHeight);
   window.addEventListener("orientationchange", () => setTimeout(applyViewportHeight, 300));
 
-  // restore session
-  const token = await DB.getKV("token");
-  const user = await DB.getKV("user");
-  if (token && user) { setToken(token); state.user = user; }
-
-  // app lock
+  // app lock first — decide whether session may be restored
   await AppLock.load();
-  AppLock.init({ onLock: () => stopPolling(), onUnlock: () => route() });
+  AppLock.init({
+    onLock: () => secureLockTearDown(),
+    onUnlock: (pin) => secureUnlock(pin)
+  });
+
+  if (AppLock.isEnabled()) {
+    await Vault.hardenForLockedBoot();
+    // Do not restore session until unlock time is entered
+    setToken("");
+    state.user = null;
+  } else {
+    const token = await DB.getKV("token");
+    const user = await DB.getKV("user");
+    if (token && user) { setToken(token); state.user = user; }
+  }
 
   // listeners
   window.addEventListener("hashchange", route);
   window.addEventListener("online", () => { toast("Back online", "success"); flushPending(); if (state.poll.fn) state.poll.fn(); });
   window.addEventListener("offline", () => toast("You're offline", "info"));
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) { if (state.user && AppLock.isEnabled()) AppLock.lock(); return; }
-    if (state.poll.fn) state.poll.fn();
-    refreshBadge();
-  });
-  window.addEventListener("pagehide", () => { if (state.user && AppLock.isEnabled()) AppLock.lock(); });
 
-  // service worker
+  const requestLock = () => {
+    if (!AppLock.isEnabled() || AppLock.isLocked()) return;
+    if (state.user || AppLock.hasKey()) AppLock.lock();
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { requestLock(); return; }
+    if (state.poll.fn) state.poll.fn();
+    if (state.user) refreshBadge();
+  });
+  // Android Chrome PWA: lock when app is backgrounded
+  window.addEventListener("pagehide", requestLock);
+  window.addEventListener("blur", () => { if (document.hidden) requestLock(); });
+  window.addEventListener("pageshow", (e) => {
+    if (e.persisted) requestLock();
+  });
+  // Android system Back button
+  window.addEventListener("popstate", () => {
+    if (AppLock.handleBack()) return;
+  });
+
+  // service worker — force update check on Android so deploys stick
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("./service-worker.js").catch(() => {});
+    navigator.serviceWorker.register("./service-worker.js")
+      .then((reg) => { try { reg.update(); } catch (e) {} })
+      .catch(() => {});
+  }
+
+  if (AppLock.isEnabled()) {
+    // Clock only until secret time — no chat DOM underneath
+    const root = appRoot();
+    if (root) root.textContent = "";
+    await AppLock.lock();
+    return;
   }
 
   // validate session in background (silently drop if invalid)
   if (state.user) {
     call("validateSession", {}).then((d) => { if (d.user) { state.user = d.user; DB.setKV("user", d.user); } })
-      .catch(async (e) => { if (e instanceof ApiError && ["INVALID_TOKEN", "SESSION_EXPIRED", "ACCOUNT_SUSPENDED"].includes(e.code)) { await DB.clearAll(); state.user = null; setToken(""); location.hash = "#/login"; route(); } });
+      .catch(async (e) => {
+        if (e instanceof ApiError && ["INVALID_TOKEN", "SESSION_EXPIRED", "ACCOUNT_SUSPENDED"].includes(e.code)) {
+          await Vault.wipePlaintextSensitive();
+          await DB.delKV("vault");
+          AppLock.clearKey();
+          state.user = null; setToken("");
+          location.hash = "#/login"; route();
+        }
+      });
   }
 
   if (!location.hash) location.hash = state.user ? "#/chats" : "#/login";
   await route();
-  if (state.user && AppLock.isEnabled()) AppLock.lock();  // show decoy over the rendered app
   flushPending();
-  if (state.user) { refreshBadge(); state.badgeTimer = setInterval(refreshBadge, 20000); }
+  if (state.user) { refreshBadge(); state.badgeTimer = setInterval(refreshBadge, 8000); }
 }
 
 boot();
