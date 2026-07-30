@@ -2,7 +2,7 @@
 //  Ripple service worker — offline app shell.
 //  Bump CACHE_VERSION whenever you deploy new frontend files.
 // =============================================================================
-const CACHE_VERSION = "ripple-v9";
+const CACHE_VERSION = "clocker-v21";
 const SHELL = [
   "./",
   "./index.html",
@@ -11,6 +11,8 @@ const SHELL = [
   "./js/config.js",
   "./js/api.js",
   "./js/db.js",
+  "./js/crypto.js",
+  "./js/vault.js",
   "./js/app.js",
   "./js/lock.js",
   "./icons/icon-192.png",
@@ -43,7 +45,20 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Static same-origin assets: cache-first, then network (and cache the result).
+  // App code: network-first so phones pick up deploys; fall back to cache offline
+  const path = url.pathname;
+  if (path.includes("/js/") || path.endsWith(".css") || path.endsWith("service-worker.js")) {
+    event.respondWith(
+      fetch(req).then((res) => {
+        const copy = res.clone();
+        caches.open(CACHE_VERSION).then((c) => c.put(req, copy));
+        return res;
+      }).catch(() => caches.match(req))
+    );
+    return;
+  }
+
+  // Static same-origin assets (icons etc): cache-first
   event.respondWith(
     caches.match(req).then((cached) =>
       cached || fetch(req).then((res) => {
