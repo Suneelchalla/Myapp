@@ -54,6 +54,8 @@ export const AppLock = {
   _key: null, // AES key in memory only while unlocked
   _locking: false,
   _busy: false,
+  _sealPromise: null,
+  _unlockFails: 0,
   /* timer decoy */
   _timerSec: 5 * 60,
   _timerLeft: 5 * 60,
@@ -89,11 +91,12 @@ export const AppLock = {
       enabled: true,
       salt,
       kdfSalt: bytesToB64(kdfSalt),
+      kdfIters: 60000,
       chatHash: await sha256Hex(salt + "|chat|" + c),
       v: 2
     };
     await DB.setKV("lock", this._cfg);
-    this._key = await deriveKey(c, kdfSalt);
+    this._key = await deriveKey(c, kdfSalt, this._cfg.kdfIters);
     return this._key;
   },
 
@@ -126,7 +129,9 @@ export const AppLock = {
   /** Derive vault key after a successful PIN check. */
   async unlockKey(pin) {
     const dig = normalizeTimePin(pin) || String(pin || "").replace(/\D/g, "");
-    this._key = await deriveKey(dig, this._kdfSaltBytes());
+    // Legacy vaults used 100000 before kdfIters was stored
+    const iters = this._cfg.kdfIters || 100000;
+    this._key = await deriveKey(dig, this._kdfSaltBytes(), iters);
     return this._key;
   },
 
@@ -134,8 +139,8 @@ export const AppLock = {
     if (this._locked || !this._cfg.enabled || this._locking) return;
     this._locking = true;
     try {
-      if (this._cb.onLock) await this._cb.onLock();
-      this._key = null; // never leave the key in memory while the clock is showing
+      const key = this._key;
+      this._key = null;
       this._locked = true;
       this._entry = "";
       this._tab = "clock";
@@ -143,16 +148,33 @@ export const AppLock = {
       this._busy = false;
       this._stopTimerLoop();
       this._stopSwLoop();
-      // Avoid duplicate overlays if lock is re-entered
+
+      // Fast path: clear chat UI first (no crypto yet)
+      if (this._cb.onLockUI) await this._cb.onLockUI();
+
       if (this._overlay) { this._overlay.remove(); this._overlay = null; }
       this._build();
       document.body.appendChild(this._overlay);
       document.body.classList.add("is-locked");
-      // Trap Android system Back so it doesn't leave an empty app under the clock
       try { history.pushState({ clockerLock: 1 }, ""); } catch (e) {}
       this._startClock();
+
+      // Slow path: encrypt vault AFTER clock is on screen (don't freeze Android)
+      if (key && this._cb.onLockSeal) {
+        const p = Promise.resolve().then(() => this._cb.onLockSeal(key));
+        this._sealPromise = p;
+        p.catch(() => {}).finally(() => {
+          if (this._sealPromise === p) this._sealPromise = null;
+        });
+      }
     } finally {
       this._locking = false;
+    }
+  },
+
+  async awaitSeal() {
+    if (this._sealPromise) {
+      try { await this._sealPromise; } catch (e) {}
     }
   },
 
@@ -160,6 +182,9 @@ export const AppLock = {
     const pin = pinOverride || this._entry;
     this._alarms = [];
     try { await this._saveAlarms(); } catch (e) {}
+
+    // Wait for in-flight seal so unlock doesn't race with wipe
+    await this.awaitSeal();
 
     // Drop lock UI first so route() can paint chats
     this._locked = false;
@@ -172,6 +197,7 @@ export const AppLock = {
 
     try {
       if (this._cb.onUnlock) await this._cb.onUnlock(pin);
+      this._unlockFails = 0;
     } catch (e) {
       // Wrong crypto / corrupt vault — show clock again
       await this.lock();
@@ -507,13 +533,20 @@ export const AppLock = {
     this._busy = true;
     this._setSheetStatus("Checking…");
     try {
-      // Exact Messages secret → chats (and clear decoy alarms). Anything else → fake alarm.
+      // Throttle unlock probing (clock times are a small search space)
+      if (this._unlockFails >= 8) {
+        const wait = Math.min(30000, 1500 * Math.pow(1.6, this._unlockFails - 8));
+        this._setSheetStatus("Wait…");
+        await new Promise((r) => setTimeout(r, wait));
+      }
+
       if (await this._isChatPin(this._entry)) {
         this._setSheetStatus("Opening…");
         await this._finishChat();
         return;
       }
 
+      this._unlockFails += 1;
       const valid = normalizeTimePin(this._entry);
       if (valid) {
         const time = valid.slice(0, 2) + ":" + valid.slice(2, 4);
