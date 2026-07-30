@@ -30,6 +30,14 @@ const COALESCE = new Set([
   "listContacts", "listContactRequests", "getConversation", "validateSession"
 ]);
 const _inflight = new Map();
+/** GAS is single-threaded — never overlap requests (overlap = multi-second UI freeze). */
+let _gate = Promise.resolve();
+
+function enqueue(fn) {
+  const run = _gate.then(fn, fn);
+  _gate = run.then(() => {}, () => {});
+  return run;
+}
 
 /**
  * Call a backend action.
@@ -48,7 +56,7 @@ export async function call(action, payload = {}, opts = {}) {
     : null;
   if (key && _inflight.has(key)) return _inflight.get(key);
 
-  const p = doFetch(action, payload, opts).finally(() => {
+  const p = enqueue(() => doFetch(action, payload, opts)).finally(() => {
     if (key) _inflight.delete(key);
   });
   if (key) _inflight.set(key, p);
