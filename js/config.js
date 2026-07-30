@@ -7,12 +7,12 @@ export const API_URL = "https://script.google.com/macros/s/AKfycbwVHL6nX4_HoetIC
 
 // Polling — Apps Script is slow; aggressive polling stacks requests and lags the whole app.
 export const POLL = {
-  OPEN_CONVERSATION: 3500,   // open chat (was 800 — flooded GAS)
-  CHAT_LIST: 12000,          // chats tab
-  CONTACTS: 30000,           // contacts tab
-  BADGE: 30000,              // app badge while elsewhere
-  HIDDEN_TAB: 45000,         // tab / app backgrounded
-  CATCH_UP: 1500             // after new messages arrive (min gap)
+  OPEN_CONVERSATION: 10000,  // open chat — GAS cold/slow; faster = stacked lag
+  CHAT_LIST: 25000,          // chats tab
+  CONTACTS: 60000,           // contacts tab
+  BADGE: 90000,              // app badge
+  HIDDEN_TAB: 180000,        // backgrounded — almost idle
+  CATCH_UP: 7000             // after new messages (still behind OPEN base)
 };
 
 export const APP_NAME = "Clocker";
