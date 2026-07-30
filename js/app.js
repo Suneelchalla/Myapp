@@ -68,8 +68,9 @@ function toast(message, kind = "info") {
 }
 function errText(e) {
   if (e instanceof ApiError) {
-    if (e.code === "NETWORK") return "You're offline — we'll retry automatically.";
-    if (e.code === "NOT_CONFIGURED") return e.message;
+    if (e.code === "NETWORK" || e.code === "TIMEOUT" || e.code === "BAD_RESPONSE" || e.code === "NOT_CONFIGURED") {
+      return e.message || "Connection problem.";
+    }
     return e.message || "Something went wrong.";
   }
   return "Something went wrong.";
@@ -166,11 +167,22 @@ function renderLogin() {
 
   async function doLogin() {
     submit.disabled = true; submit.textContent = "Signing in…";
-    try {
-      const data = await call("login", { username: username.value, password: password.value, deviceId: state.deviceId });
-      await afterAuth(data);
-    } catch (e) { toast(errText(e), "error"); }
-    finally { submit.disabled = false; submit.textContent = "Sign in"; }
+    let lastErr = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (attempt > 0) { submit.textContent = "Retrying…"; toast("Waking server…", "info"); }
+        const data = await call("login", { username: username.value, password: password.value, deviceId: state.deviceId });
+        await afterAuth(data);
+        lastErr = null;
+        break;
+      } catch (e) {
+        lastErr = e;
+        // One automatic retry — Apps Script cold start is common on Android
+        if (!(e instanceof ApiError) || !["TIMEOUT", "NETWORK"].includes(e.code) || attempt === 1) break;
+      }
+    }
+    if (lastErr) toast(errText(lastErr), "error");
+    submit.disabled = false; submit.textContent = "Sign in";
   }
   submit.addEventListener("click", doLogin);
   [username, password].forEach((i) => i.addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); }));
@@ -279,7 +291,8 @@ async function renderChatList() {
   if (cached.length) paintChatList(container, cached);
   else container.appendChild(skeletonList());
 
-  await refreshChatList(container);
+  // Don't block the tab on a slow Apps Script round-trip
+  refreshChatList(container);
   startPolling(POLL.CHAT_LIST, () => refreshChatList(container));
 }
 async function refreshChatList(container) {
@@ -322,16 +335,21 @@ function paintChatList(container, conversations) {
   if (!list.length) { container.appendChild(emptyState("chats", "No conversations yet", "Head to Contacts to add someone, then start chatting.")); return; }
   list.forEach((c) => {
     const other = c.otherUser || { displayName: c.title || "Conversation" };
+    const lastSeq = c.lastMessageSequence || 0;
+    const cleared = c.clearedBeforeSequence || 0;
+    const hasVisible = lastSeq > cleared;
+    const preview = hasVisible ? (c.lastMessagePreview || "") : (lastSeq === 0 ? "Say hi 👋" : "No messages");
+    const timeTxt = hasVisible && c.lastMessageAt ? timeOf(c.lastMessageAt) : "";
     const row = el("a", { class: "row", href: "#/chat/" + c.conversationId }, [
       avatar(other, 52),
       el("div", { class: "row__main" }, [
         el("div", { class: "row__top" }, [
           el("span", { class: "row__name", text: other.displayName || other.username || "Conversation" }),
-          el("span", { class: "row__time", text: c.lastMessageAt ? timeOf(c.lastMessageAt) : "" })
+          el("span", { class: "row__time", text: timeTxt })
         ]),
         el("div", { class: "row__bottom" }, [
-          el("span", { class: "row__preview", text: c.lastMessagePreview || "Say hi 👋" }),
-          c.unreadCount > 0 ? el("span", { class: "badge", text: String(c.unreadCount) }) : null
+          el("span", { class: "row__preview", text: preview }),
+          hasVisible && c.unreadCount > 0 ? el("span", { class: "badge", text: String(c.unreadCount) }) : null
         ].filter(Boolean))
       ])
     ]);
@@ -357,21 +375,39 @@ async function renderContacts() {
   let directory = [];
   const rel = { contacts: new Set(), outgoing: new Set(), incoming: new Map() };
 
-  async function loadAll() {
+  function applyPayload(data) {
+    directory = data.users || [];
+    rel.contacts = new Set((data.contacts || []).map((u) => u.userId));
+    rel.outgoing = new Set((data.outgoing || []).map((r) => (r.receiver && r.receiver.userId) || r.receiverId));
+    rel.incoming = new Map((data.incoming || []).map((r) => [(r.requester && r.requester.userId) || r.requesterId, r.contactId]));
+    paintRequests(data.incoming || []);
+    paintPeople();
+  }
+
+  async function loadAll(silent) {
     try {
-      const [dir, cts, reqs] = await Promise.all([
-        call("listDirectory", {}),
-        call("listContacts", {}),
-        call("listContactRequests", {})
-      ]);
-      directory = dir.users || [];
-      rel.contacts = new Set((cts.contacts || []).map((u) => u.userId));
-      rel.outgoing = new Set((reqs.outgoing || []).map((r) => (r.receiver && r.receiver.userId) || r.receiverId));
-      rel.incoming = new Map((reqs.incoming || []).map((r) => [(r.requester && r.requester.userId) || r.requesterId, r.contactId]));
-      paintRequests(reqs.incoming || []);
-      paintPeople();
+      let data;
+      try {
+        // Prefer one round-trip (new backend). Fall back if not redeployed yet.
+        data = await call("contactsHome", {});
+      } catch (e) {
+        if (!(e instanceof ApiError) || e.code === "NETWORK" || e.code === "TIMEOUT") throw e;
+        const [dir, cts, reqs] = await Promise.all([
+          call("listDirectory", {}),
+          call("listContacts", {}),
+          call("listContactRequests", {})
+        ]);
+        data = {
+          users: dir.users || [],
+          contacts: cts.contacts || [],
+          incoming: (reqs.incoming || []),
+          outgoing: (reqs.outgoing || [])
+        };
+      }
+      await DB.setKV("contactsCache", data);
+      applyPayload(data);
     } catch (e) {
-      if (!(e instanceof ApiError && e.code === "NETWORK")) toast(errText(e), "error");
+      if (!silent && !(e instanceof ApiError && (e.code === "NETWORK" || e.code === "TIMEOUT"))) toast(errText(e), "error");
     }
   }
 
@@ -430,8 +466,12 @@ async function renderContacts() {
   }
 
   search.addEventListener("input", () => paintPeople());
-  await loadAll();
-  startPolling(POLL.CHAT_LIST, () => loadAll());
+
+  // Instant paint from cache, then refresh in background
+  const cached = await DB.getKV("contactsCache");
+  if (cached && (cached.users || cached.contacts)) applyPayload(cached);
+  loadAll();
+  startPolling(POLL.CONTACTS, () => loadAll(true));
 }
 async function startChat(user) {
   try {
@@ -503,13 +543,16 @@ async function renderConversation(conversationId) {
   if (visible.length) state.activeConversation.lastSequence = visible[visible.length - 1].sequenceNumber || 0;
   scrollBottom(thread);
 
-  await pollConversation(thread, true);
+  // Cache is already on screen — refresh in background (don't freeze the composer)
+  pollConversation(thread, true);
   startPolling(POLL.OPEN_CONVERSATION, () => pollConversation(thread, false));
 }
 
 async function pollConversation(thread, first) {
   const ac = state.activeConversation;
   if (!ac) return;
+  if (state.poll.msgInFlight) return;
+  state.poll.msgInFlight = true;
   // Never block inbound fetch on outbound send — run flush in parallel
   flushPending().catch(() => {});
   try {
@@ -521,19 +564,20 @@ async function pollConversation(thread, first) {
       ac.lastSequence = Math.max(ac.lastSequence, ...messages.map((m) => m.sequenceNumber || 0));
       if (wasBottom || first) scrollBottom(thread);
       markRead(ac.conversationId, ac.lastSequence);
-      // More may be in flight — pull again almost immediately
       state.poll.burst = true;
     }
     if (readUpTo != null && readUpTo > ac.readUpTo) { ac.readUpTo = readUpTo; markReadTicks(readUpTo); }
   } catch (e) { /* transient GAS hiccup: stay quiet, next poll retries */ }
+  finally { state.poll.msgInFlight = false; }
 
-  // refresh presence every ~5 ticks (non-blocking)
-  state.poll.presenceTick = (state.poll.presenceTick + 1) % 8;
-  if (first || state.poll.presenceTick === 0) refreshPresence();
+  // Presence rarely — each getConversation is another slow GAS hit
+  state.poll.presenceTick = (state.poll.presenceTick + 1) % 20;
+  if (!first && state.poll.presenceTick === 0) refreshPresence();
 }
 async function refreshPresence() {
   const ac = state.activeConversation;
-  if (!ac) return;
+  if (!ac || state.poll.presenceInFlight) return;
+  state.poll.presenceInFlight = true;
   try {
     const { conversation } = await call("getConversation", { conversationId: ac.conversationId });
     ac.otherUser = conversation.otherUser || ac.otherUser;
@@ -542,12 +586,17 @@ async function refreshPresence() {
     const av = $(".topbar .avatar");
     if (av) { av.querySelector(".avatar__dot")?.remove(); if (ac.otherUser.online) av.appendChild(el("span", { class: "avatar__dot" })); }
   } catch (e) {}
+  finally { state.poll.presenceInFlight = false; }
 }
 
 let _readTimer = null;
 function markRead(conversationId, seq) {
   clearTimeout(_readTimer);
-  _readTimer = setTimeout(() => { call("markConversationRead", { conversationId, lastReadSequence: seq }).then(() => refreshBadge()).catch(() => {}); }, 600);
+  _readTimer = setTimeout(() => {
+    // Clear local badge for this open chat; skip listConversations (expensive)
+    applyBadge(0);
+    call("markConversationRead", { conversationId, lastReadSequence: seq }).catch(() => {});
+  }, 1200);
 }
 
 function paintThread(thread, messages) {
@@ -708,6 +757,16 @@ function clearChat(conversationId) {
       if (state.activeConversation) {
         state.activeConversation.clearedBefore = clearedBeforeSequence;
         state.activeConversation.lastSequence = clearedBeforeSequence;
+      }
+      // Hide last-message preview in the chat list for this device
+      const convs = await DB.getConversations();
+      const conv = convs.find((c) => c.conversationId === conversationId);
+      if (conv) {
+        conv.clearedBeforeSequence = clearedBeforeSequence;
+        conv.lastMessagePreview = "";
+        conv.lastMessageAt = "";
+        conv.unreadCount = 0;
+        await DB.putConversation(conv);
       }
       closeOverlays();
       const thread = $("#thread"); if (thread) thread.textContent = "";
@@ -968,17 +1027,23 @@ function startPolling(interval, fn) {
   state.poll.burst = false;
   const schedule = (delay) => { state.poll.timer = setTimeout(tick, delay); };
   const tick = async () => {
-    const started = Date.now();
     await fn();
-    let next;
-    if (document.hidden) next = POLL.HIDDEN_TAB;
-    else if (state.poll.burst) { next = POLL.CATCH_UP; state.poll.burst = false; }
-    else next = Math.max(0, interval - (Date.now() - started)); // don't add full wait on top of slow GAS
+    // Always wait AFTER the previous call finishes — never stack on slow GAS
+    let next = document.hidden ? POLL.HIDDEN_TAB : interval;
+    if (state.poll.burst && !document.hidden) {
+      next = POLL.CATCH_UP;
+      state.poll.burst = false;
+    }
     schedule(next);
   };
   schedule(interval);
 }
-function stopPolling() { if (state.poll.timer) { clearTimeout(state.poll.timer); state.poll.timer = null; } state.poll.fn = null; }
+function stopPolling() {
+  if (state.poll.timer) { clearTimeout(state.poll.timer); state.poll.timer = null; }
+  state.poll.fn = null;
+  state.poll.msgInFlight = false;
+  state.poll.presenceInFlight = false;
+}
 
 /* ======================================================= SYNC (offline) == */
 async function flushPending() {
@@ -1002,7 +1067,7 @@ async function flushPending() {
         // Transient (offline, cold start, temporary server hiccup): keep the
         // message queued and retry next cycle. Resends are safe — the server
         // de-duplicates by clientMessageId — so nothing sends twice.
-        if (["NETWORK", "BAD_RESPONSE", "INTERNAL_ERROR", "RATE_LIMITED"].includes(code)) break;
+        if (["NETWORK", "TIMEOUT", "BAD_RESPONSE", "INTERNAL_ERROR", "RATE_LIMITED"].includes(code)) break;
         // Genuine error (e.g. validation): flag the bubble, no popup.
         item.status = "failed"; await DB.addPending(item);
         const node = document.querySelector(`[data-cid="${CSS.escape(item.clientMessageId)}"]`);
@@ -1105,7 +1170,7 @@ async function secureUnlock(pin) {
     flushPending();
     refreshBadge();
     if (state.badgeTimer) clearInterval(state.badgeTimer);
-    state.badgeTimer = setInterval(refreshBadge, 8000);
+    state.badgeTimer = setInterval(refreshBadge, POLL.BADGE);
   } else {
     // Vault missing / wiped on upgrade — unlock succeeded but need to sign in again
     setToken("");
@@ -1208,7 +1273,7 @@ async function boot() {
   if (!location.hash) location.hash = state.user ? "#/chats" : "#/login";
   await route();
   flushPending();
-  if (state.user) { refreshBadge(); state.badgeTimer = setInterval(refreshBadge, 8000); }
+  if (state.user) { refreshBadge(); state.badgeTimer = setInterval(refreshBadge, POLL.BADGE); }
 }
 
 boot();
