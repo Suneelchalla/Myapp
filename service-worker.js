@@ -2,7 +2,7 @@
 //  Ripple service worker — offline app shell.
 //  Bump CACHE_VERSION whenever you deploy new frontend files.
 // =============================================================================
-const CACHE_VERSION = "clocker-v25";
+const CACHE_VERSION = "clocker-v28";
 const SHELL = [
   "./",
   "./index.html",
@@ -34,38 +34,26 @@ self.addEventListener("activate", (e) => {
 
 self.addEventListener("fetch", (event) => {
   const req = event.request;
-  if (req.method !== "GET") return;                 // never cache POSTs (all API traffic)
+  if (req.method !== "GET") return;
 
   const url = new URL(req.url);
-  if (url.origin !== self.location.origin) return;  // let cross-origin (Apps Script API) pass through
+  if (url.origin !== self.location.origin) return;
 
-  // Navigations: serve cached shell when offline (SPA fallback).
   if (req.mode === "navigate") {
     event.respondWith(fetch(req).catch(() => caches.match("./index.html")));
     return;
   }
 
-  // App code: network-first so phones pick up deploys; fall back to cache offline
-  const path = url.pathname;
-  if (path.includes("/js/") || path.endsWith(".css") || path.endsWith("service-worker.js")) {
-    event.respondWith(
-      fetch(req).then((res) => {
-        const copy = res.clone();
-        caches.open(CACHE_VERSION).then((c) => c.put(req, copy));
-        return res;
-      }).catch(() => caches.match(req))
-    );
-    return;
-  }
-
-  // Static same-origin assets (icons etc): cache-first
+  // Cache-first for app shell — much snappier on Android than network-first
   event.respondWith(
-    caches.match(req).then((cached) =>
-      cached || fetch(req).then((res) => {
+    caches.match(req).then((cached) => {
+      const fetchPromise = fetch(req).then((res) => {
         const copy = res.clone();
         caches.open(CACHE_VERSION).then((c) => c.put(req, copy));
         return res;
-      }).catch(() => cached)
-    )
+      }).catch(() => cached);
+      // Prefer cache immediately; update in background when online
+      return cached || fetchPromise;
+    })
   );
 });
