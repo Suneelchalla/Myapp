@@ -1,6 +1,9 @@
 // =============================================================================
 //  API client. Every call is a preflight-free POST (text/plain) carrying a
 //  JSON envelope. The session token travels in the body, never the URL.
+//
+//  Google Apps Script is single-threaded + slow. We coalesce identical in-flight
+//  reads and avoid stampeding the backend (which made the whole app feel laggy).
 // =============================================================================
 import { API_URL } from "./config.js";
 
@@ -21,6 +24,13 @@ export class ApiError extends Error {
   }
 }
 
+const GAS_TIMEOUT_MS = 60000;
+const COALESCE = new Set([
+  "getMessages", "listConversations", "contactsHome", "listDirectory",
+  "listContacts", "listContactRequests", "getConversation", "validateSession"
+]);
+const _inflight = new Map();
+
 /**
  * Call a backend action.
  * @param {string} action
@@ -31,6 +41,21 @@ export async function call(action, payload = {}, opts = {}) {
   if (!API_URL || API_URL.indexOf("PASTE_YOUR") === 0) {
     throw new ApiError("NOT_CONFIGURED", "The app is not connected yet. Set API_URL in js/config.js.");
   }
+
+  const coalesce = COALESCE.has(action);
+  const key = coalesce
+    ? action + "|" + JSON.stringify(payload || {}) + "|" + (opts.token !== undefined ? opts.token : _token)
+    : null;
+  if (key && _inflight.has(key)) return _inflight.get(key);
+
+  const p = doFetch(action, payload, opts).finally(() => {
+    if (key) _inflight.delete(key);
+  });
+  if (key) _inflight.set(key, p);
+  return p;
+}
+
+async function doFetch(action, payload, opts) {
   const body = JSON.stringify({
     action,
     token: opts.token !== undefined ? opts.token : _token,
@@ -41,24 +66,45 @@ export async function call(action, payload = {}, opts = {}) {
 
   let res;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20000); // don't let a stuck request hang the app
+  const timer = setTimeout(() => controller.abort(), GAS_TIMEOUT_MS);
   try {
     res = await fetch(API_URL, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
       body,
       redirect: "follow",
+      mode: "cors",
+      credentials: "omit",
+      cache: "no-store",
       signal: controller.signal
     });
   } catch (netErr) {
-    throw new ApiError("NETWORK", "You appear to be offline.");
+    const name = netErr && netErr.name;
+    const msg = String((netErr && netErr.message) || "");
+    if (name === "AbortError" || /aborted/i.test(msg)) {
+      throw new ApiError("TIMEOUT", "Server is waking up — wait a moment and try again.");
+    }
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      throw new ApiError("NETWORK", "You're offline — we'll retry automatically.");
+    }
+    throw new ApiError("NETWORK", "Can't reach the server. Check the Web App URL / redeploy Apps Script (Anyone access).");
   } finally {
     clearTimeout(timer);
   }
 
+  const ctype = (res.headers && res.headers.get("content-type")) || "";
   let json;
-  try { json = await res.json(); }
-  catch (e) { throw new ApiError("BAD_RESPONSE", "Unexpected server response."); }
+  try {
+    const text = await res.text();
+    if (!text) throw new Error("empty");
+    if (ctype.includes("text/html") || text.trim().charAt(0) === "<") {
+      throw new ApiError("BAD_RESPONSE", "Got an HTML page instead of JSON. Redeploy the Web App (Execute as: Me, Who has access: Anyone).");
+    }
+    json = JSON.parse(text);
+  } catch (e) {
+    if (e instanceof ApiError) throw e;
+    throw new ApiError("BAD_RESPONSE", "Unexpected server response.");
+  }
 
   if (!json || json.success !== true) {
     const err = (json && json.error) || {};
