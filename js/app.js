@@ -331,7 +331,7 @@ function shell(headerNode, contentNode, opts = {}) {
 
   const tabs = hideNav ? null : el("nav", { class: "bottomnav", "aria-label": "Primary" }, [
     navButton("chats", "Chats", "#/chats"),
-    navButton("people", "Contacts", "#/contacts"),
+    navButton("people", "Signals", "#/signals"),
     navButton("user", "Profile", "#/profile")
   ]);
   mount(el("div", { class: "shell" }, [headerNode, el("main", { class: "content", id: "content" }, contentNode), tabs].filter(Boolean)));
@@ -400,7 +400,7 @@ async function renderChatList() {
       state.mem.conversations = cached;
       paintChatList(container, cached);
     } else {
-      container.appendChild(emptyState("chats", "No conversations yet", "Head to Contacts to add someone, then start chatting."));
+      container.appendChild(emptyState("chats", "No conversations yet", "Head to Signals to connect with someone, then start chatting."));
     }
   }
 
@@ -455,7 +455,7 @@ async function refreshBadge() {
 function paintChatList(container, conversations) {
   container.textContent = "";
   const list = conversations.slice().sort((a, b) => (b.lastMessageAt || "").localeCompare(a.lastMessageAt || ""));
-  if (!list.length) { container.appendChild(emptyState("chats", "No conversations yet", "Head to Contacts to add someone, then start chatting.")); return; }
+  if (!list.length) { container.appendChild(emptyState("chats", "No conversations yet", "Head to Signals to connect with someone, then start chatting.")); return; }
   list.forEach((c) => {
     const other = c.otherUser || { displayName: c.title || "Conversation" };
     const lastSeq = c.lastMessageSequence || 0;
@@ -481,145 +481,194 @@ function paintChatList(container, conversations) {
 }
 
 /* ======================================================= CONTACTS ========= */
-async function renderContacts() {
-  stopPolling();
-  const search = el("input", { class: "input", type: "search", placeholder: "Search people by name or username", "aria-label": "Search people" });
-  const header = el("header", { class: "topbar topbar--stack" }, [
-    el("h1", { class: "topbar__title", text: "Contacts" }),
-    el("div", { class: "searchbar" }, [search])
-  ]);
-  const requestsBox = el("div", { class: "section", id: "requests" });
-  const peopleBox = el("div", { class: "section", id: "people" });
-  shell(header, [requestsBox, peopleBox]);
+/* ======================================================= SIGNALS ========= */
+// Rebrand knobs — change these strings to rename the whole tab in one place.
+// e.g. Frequencies / Keys / Cipher / Orbit — and update the nav label + router.
+const SIGNAL = {
+  tab: "Signals",
+  code: "Your Signal Code",
+  connectTitle: "Connect with someone",
+  connect: "Connect",
+  requests: "Requests",
+  pending: "Pending",
+  linked: "Linked"
+};
 
-  let directory = [];
-  const rel = { contacts: new Set(), outgoing: new Map(), incoming: new Map() };
+function myCodeText() {
+  const c = state.user && state.user.pairingCode;
+  return c ? String(c) : "—";
+}
+
+function paintMyCode(box) {
+  box.textContent = "";
+  const code = myCodeText();
+  box.appendChild(el("div", { class: "card" }, [
+    el("h3", { class: "card__title", text: SIGNAL.code }),
+    el("div", { text: code, style: "font-size:30px;font-weight:800;letter-spacing:8px;text-align:center;padding:6px 0" }),
+    el("div", { class: "row__actions", style: "justify-content:center" }, [
+      el("button", { class: "btn btn--ghost btn--sm", text: "Copy code", onclick: async () => {
+        try { await navigator.clipboard.writeText(code); toast("Code copied", "success"); }
+        catch (e) { toast("Copy failed — write it down", "error"); }
+      } })
+    ]),
+    el("p", { class: "hint", style: "padding:0", text: "Share this only with people you want to reach you." })
+  ]));
+}
+
+function paintConnect(box, reload) {
+  box.textContent = "";
+  const input = el("input", {
+    class: "input", type: "text", inputmode: "numeric", maxlength: "5",
+    placeholder: "Enter a 5-digit code", autocomplete: "off", "aria-label": "Enter a code to connect"
+  });
+  input.addEventListener("input", () => { input.value = input.value.replace(/\D/g, "").slice(0, 5); });
+  const btn = el("button", { class: "btn btn--primary btn--block", text: SIGNAL.connect });
+  const submit = async () => {
+    const code = input.value.replace(/\D/g, "");
+    if (code.length !== 5) { toast("Enter the full 5-digit code", "error"); return; }
+    btn.disabled = true; const label = btn.textContent; btn.textContent = "Sending…";
+    try {
+      const data = await call("pairByCode", { code });
+      input.value = "";
+      if (data && data.alreadyPaired) toast("Already linked", "info");
+      else if (data && data.linked) toast("Linked!", "success");
+      else if (data && data.pending) toast("Already requested", "info");
+      else toast("Request sent", "success");
+      if (reload) reload();
+    } catch (e) { toast(errText(e), "error"); }
+    finally { btn.disabled = false; btn.textContent = label; }
+  };
+  btn.addEventListener("click", submit);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+  box.appendChild(el("div", { class: "card" }, [
+    el("h3", { class: "card__title", text: SIGNAL.connectTitle }),
+    el("p", { class: "hint", style: "padding:0", text: "Ask for their code, enter it here, and they'll get a request to link with you." }),
+    field("Their code", input),
+    btn
+  ]));
+}
+
+function paintSignalRequests(box, incoming, outgoing, reload) {
+  box.textContent = "";
+  if (incoming && incoming.length) {
+    box.appendChild(el("h3", { class: "section__title", text: SIGNAL.requests }));
+    incoming.forEach((r) => {
+      const u = r.requester || {};
+      const accept = el("button", { class: "btn btn--sm btn--primary", text: "Accept", onclick: async () => {
+        try { await call("acceptContactRequest", { contactId: r.contactId }); toast("Linked", "success"); if (reload) reload(); }
+        catch (e) { toast(errText(e), "error"); } } });
+      const decline = el("button", { class: "btn btn--sm btn--ghost", text: "Decline", onclick: async () => {
+        try { await call("rejectContactRequest", { contactId: r.contactId }); if (reload) reload(); }
+        catch (e) { toast(errText(e), "error"); } } });
+      box.appendChild(el("div", { class: "row row--compact" }, [
+        avatar(u, 44),
+        el("div", { class: "row__main" }, [
+          el("span", { class: "row__name", text: u.displayName || "New request" }),
+          el("span", { class: "row__preview", text: u.username ? "@" + u.username : "wants to link" })
+        ]),
+        el("div", { class: "row__actions" }, [accept, decline])
+      ]));
+    });
+  }
+  if (outgoing && outgoing.length) {
+    box.appendChild(el("h3", { class: "section__title", text: SIGNAL.pending }));
+    outgoing.forEach((r) => {
+      const u = r.receiver || {};
+      const cancel = el("button", { class: "btn btn--sm btn--ghost", text: "Cancel", onclick: async () => {
+        try { await call("cancelContactRequest", { contactId: r.contactId }); toast("Request cancelled", "success"); if (reload) reload(); }
+        catch (e) { toast(errText(e), "error"); } } });
+      box.appendChild(el("div", { class: "row row--compact" }, [
+        avatar(u, 44),
+        el("div", { class: "row__main" }, [
+          el("span", { class: "row__name", text: u.displayName || "Pending" }),
+          el("span", { class: "row__preview", text: "waiting for them to accept" })
+        ]),
+        cancel
+      ]));
+    });
+  }
+}
+
+function paintLinked(box, paired) {
+  box.textContent = "";
+  box.appendChild(el("h3", { class: "section__title", text: SIGNAL.linked }));
+  if (!paired || !paired.length) {
+    box.appendChild(emptyState("people", "No one linked yet", "Share your code, or enter someone else's above to connect."));
+    return;
+  }
+  paired.forEach((u) => {
+    box.appendChild(el("div", { class: "row row--compact" }, [
+      avatar(u, 44),
+      el("div", { class: "row__main" }, [
+        el("span", { class: "row__name", text: u.displayName }),
+        el("span", { class: "row__preview", text: u.online ? "online" : "@" + u.username })
+      ]),
+      el("div", { class: "row__actions" }, [
+        el("button", { class: "btn btn--sm btn--ghost", text: "Message", onclick: () => startChat(u) }),
+        el("button", { class: "btn btn--sm btn--danger", text: "Remove", onclick: async () => {
+          try { await call("removeContact", { userId: u.userId }); toast("Removed", "success"); if (state.poll.fn) state.poll.fn(); }
+          catch (e) { toast(errText(e), "error"); } } })
+      ])
+    ]));
+  });
+}
+
+async function renderSignals() {
+  stopPolling();
+  const header = el("header", { class: "topbar" }, [
+    el("div", { class: "topbar__titles" }, [el("h1", { class: "topbar__title", text: SIGNAL.tab })])
+  ]);
+  const codeBox = el("div", { class: "section", id: "mycode" });
+  const connectBox = el("div", { class: "section", id: "connect" });
+  const requestsBox = el("div", { class: "section", id: "requests" });
+  const linkedBox = el("div", { class: "section", id: "linked" });
+  shell(header, [codeBox, connectBox, requestsBox, linkedBox]);
+
+  const reload = () => { if (state.poll.fn) state.poll.fn(); };
+
+  paintMyCode(codeBox);
+  paintConnect(connectBox, reload);
 
   function applyPayload(data) {
-    directory = data.users || [];
-    rel.contacts = new Set((data.contacts || []).map((u) => u.userId));
-    rel.outgoing = new Map((data.outgoing || []).map((r) => [(r.receiver && r.receiver.userId) || r.receiverId, r.contactId]));
-    rel.incoming = new Map((data.incoming || []).map((r) => [(r.requester && r.requester.userId) || r.requesterId, r.contactId]));
-    paintRequests(data.incoming || []);
-    paintPeople();
+    paintSignalRequests(requestsBox, data.incoming || [], data.outgoing || [], reload);
+    paintLinked(linkedBox, data.paired || data.contacts || []);
   }
 
   async function loadAll(silent) {
     try {
       let data;
       try {
-        data = await call("contactsHome", {});
+        data = await call("pairingHome", {});
       } catch (e) {
         if (!(e instanceof ApiError) || e.code === "NETWORK" || e.code === "TIMEOUT") throw e;
-        const [dir, cts, reqs] = await Promise.all([
-          call("listDirectory", {}),
-          call("listContacts", {}),
-          call("listContactRequests", {})
-        ]);
-        data = {
-          users: dir.users || [],
-          contacts: cts.contacts || [],
-          incoming: (reqs.incoming || []),
-          outgoing: (reqs.outgoing || [])
-        };
+        // Fallback if the backend hasn't been updated to pairingHome yet
+        const [cts, reqs] = await Promise.all([call("listContacts", {}), call("listContactRequests", {})]);
+        data = { paired: cts.contacts || [], incoming: reqs.incoming || [], outgoing: reqs.outgoing || [] };
       }
       state.mem.contacts = data;
       state.mem.contactsAt = Date.now();
       await DB.setKV("contactsCache", data);
-      if (state.route.name === "contacts") applyPayload(data);
+      if (state.route.name === "signals") applyPayload(data);
     } catch (e) {
       if (isSessionDead(e)) { forceReLogin(e); return; }
       if (!silent && !(e instanceof ApiError && (e.code === "NETWORK" || e.code === "TIMEOUT"))) toast(errText(e), "error");
     }
   }
 
-  function paintRequests(incoming) {
-    requestsBox.textContent = "";
-    if (!incoming.length) return;
-    requestsBox.appendChild(el("h3", { class: "section__title", text: "Requests" }));
-    incoming.forEach((r) => {
-      const u = r.requester || {};
-      const accept = el("button", { class: "btn btn--sm btn--primary", text: "Accept", onclick: async () => {
-        try { await call("acceptContactRequest", { contactId: r.contactId }); toast("Contact added", "success"); loadAll(); }
-        catch (e) { toast(errText(e), "error"); } } });
-      const reject = el("button", { class: "btn btn--sm btn--ghost", text: "Decline", onclick: async () => {
-        try { await call("rejectContactRequest", { contactId: r.contactId }); loadAll(); }
-        catch (e) { toast(errText(e), "error"); } } });
-      requestsBox.appendChild(el("div", { class: "row row--compact" }, [
-        avatar(u, 44),
-        el("div", { class: "row__main" }, [el("span", { class: "row__name", text: u.displayName }), el("span", { class: "row__preview", text: "@" + u.username })]),
-        el("div", { class: "row__actions" }, [accept, reject])
-      ]));
-    });
-  }
-
-  function paintPeople() {
-    peopleBox.textContent = "";
-    peopleBox.appendChild(el("h3", { class: "section__title", text: "People" }));
-    const q = search.value.trim().toLowerCase();
-    const list = directory.filter((u) => !q || u.username.indexOf(q) !== -1 || String(u.displayName || "").toLowerCase().indexOf(q) !== -1);
-    if (!directory.length) { peopleBox.appendChild(emptyState("people", "No one else yet", "When other people sign up, they'll appear here to add.")); return; }
-    if (!list.length) { peopleBox.appendChild(el("p", { class: "hint", text: "No matches." })); return; }
-    list.forEach((u) => {
-      let btn;
-      if (rel.contacts.has(u.userId)) {
-        btn = el("div", { class: "row__actions" }, [
-          el("button", { class: "btn btn--sm btn--ghost", text: "Message", onclick: () => startChat(u) }),
-          el("button", { class: "btn btn--sm btn--danger", text: "Remove", onclick: async () => {
-            try {
-              await call("removeContact", { userId: u.userId });
-              toast("Contact removed", "success");
-              loadAll();
-            } catch (e) { toast(errText(e), "error"); }
-          } })
-        ]);
-      } else if (rel.incoming.has(u.userId)) {
-        btn = el("button", { class: "btn btn--sm btn--primary", text: "Accept", onclick: async () => {
-          try { await call("acceptContactRequest", { contactId: rel.incoming.get(u.userId) }); toast("Contact added", "success"); loadAll(); }
-          catch (e) { toast(errText(e), "error"); } } });
-      } else if (rel.outgoing.has(u.userId)) {
-        btn = el("button", { class: "btn btn--sm btn--ghost", text: "Cancel", onclick: async () => {
-          try {
-            await call("cancelContactRequest", { contactId: rel.outgoing.get(u.userId) });
-            toast("Request cancelled", "success");
-            loadAll();
-          } catch (e) { toast(errText(e), "error"); }
-        } });
-      } else {
-        btn = el("button", { class: "btn btn--sm btn--primary", text: "Add", onclick: async (ev) => {
-          const b = ev.currentTarget; b.disabled = true;
-          try { await call("sendContactRequest", { receiverId: u.userId }); toast("Request sent", "success"); loadAll(); }
-          catch (e) { toast(errText(e), "error"); b.disabled = false; } } });
-      }
-      peopleBox.appendChild(el("div", { class: "row row--compact" }, [
-        avatar(u, 44),
-        el("div", { class: "row__main" }, [
-          el("span", { class: "row__name", text: u.displayName }),
-          el("span", { class: "row__preview", text: u.online ? "online" : "@" + u.username })
-        ]),
-        btn
-      ]));
-    });
-  }
-
-  search.addEventListener("input", () => paintPeople());
-
-  // Instant paint from memory / IndexedDB — network only if cache is stale
+  // Instant paint from cache, then refresh in background
   if (state.mem.contacts) {
     applyPayload(state.mem.contacts);
   } else {
-    peopleBox.appendChild(el("h3", { class: "section__title", text: "People" }));
-    peopleBox.appendChild(skeletonList(4));
+    linkedBox.appendChild(el("h3", { class: "section__title", text: SIGNAL.linked }));
+    linkedBox.appendChild(skeletonList(3));
     const cached = await DB.getKV("contactsCache");
-    if (cached && (cached.users || cached.contacts)) {
-      state.mem.contacts = cached;
-      applyPayload(cached);
-    }
+    if (cached && (cached.paired || cached.contacts)) { state.mem.contacts = cached; applyPayload(cached); }
   }
   const stale = Date.now() - (state.mem.contactsAt || 0) > POLL.TAB_CACHE_MS;
   if (stale) requestAnimationFrame(() => loadAll(!!state.mem.contacts));
   startPolling(POLL.CONTACTS, () => loadAll(true));
 }
+
 async function startChat(user) {
   try {
     const { conversation } = await call("createDirectConversation", { otherUserId: user.userId });
@@ -1007,7 +1056,8 @@ async function renderProfile() {
     el("div", { class: "profile" }, [
       el("div", { class: "profile__head" }, [avatar(u, 84), el("div", {}, [
         el("h2", { class: "profile__name", text: u.displayName }),
-        el("span", { class: "profile__handle", text: "@" + u.username })
+        el("span", { class: "profile__handle", text: "@" + u.username }),
+        u.pairingCode ? el("span", { class: "profile__handle", text: "Code " + u.pairingCode, style: "letter-spacing:3px" }) : null
       ])]),
       el("div", { class: "card" }, [field("Display name", display), field("Bio", bio), saveBtn]),
       passwordCard(),
@@ -1363,7 +1413,7 @@ function parseHash() {
   if (parts[0] === "chat" && parts[1]) return { name: "conversation", param: parts[1] };
   if (parts[0] === "admin" && parts[1] === "login") return { name: "adminLogin", param: null };
   if (parts[0] === "admin") return { name: "admin", param: null };
-  const map = { register: "register", forgot: "forgot", chats: "chats", contacts: "contacts", profile: "profile", login: "login" };
+  const map = { register: "register", forgot: "forgot", chats: "chats", signals: "signals", contacts: "signals", profile: "profile", login: "login" };
   return { name: map[parts[0]] || (state.user ? "chats" : "login"), param: null };
 }
 
@@ -1372,7 +1422,7 @@ async function route() {
   closeOverlays();
   const r = parseHash();
   state.route = r;
-  const needsAuth = ["chats", "contacts", "profile", "conversation"].includes(r.name);
+  const needsAuth = ["chats", "signals", "profile", "conversation"].includes(r.name);
   if (needsAuth && !state.user) { location.hash = "#/login"; return; }
   if (state.user && ["login", "register", "forgot"].includes(r.name)) { location.hash = "#/chats"; return; }
   // Token is kept in memory — only hit IndexedDB if somehow missing
@@ -1386,7 +1436,7 @@ async function route() {
     case "register": return renderRegister();
     case "forgot": return renderForgotPassword();
     case "chats": return renderChatList();
-    case "contacts": return renderContacts();
+    case "signals": return renderSignals();
     case "conversation": return renderConversation(r.param);
     case "profile": return renderProfile();
     case "adminLogin": return renderAdminLogin();
