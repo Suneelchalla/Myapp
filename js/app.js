@@ -414,7 +414,7 @@ async function renderChatList() {
 async function refreshChatList(container) {
   if (!container.isConnected) return;
   try {
-    const { conversations } = await call("listConversations", {});
+    const { conversations } = await call("listConversations", {}, { background: true });
     state.mem.conversations = conversations;
     state.mem.conversationsAt = Date.now();
     await DB.putConversations(conversations);
@@ -447,7 +447,7 @@ async function refreshBadge() {
   // Don't compete with chat polling
   if (state.route.name === "chats" || state.route.name === "conversation") return;
   try {
-    const { conversations } = await call("listConversations", {});
+    const { conversations } = await call("listConversations", {}, { background: true });
     await DB.putConversations(conversations);
     applyBadge(conversations.reduce((n, c) => n + (c.unreadCount || 0), 0));
   } catch (e) { /* silent */ }
@@ -483,7 +483,6 @@ function paintChatList(container, conversations) {
 /* ======================================================= CONTACTS ========= */
 /* ======================================================= SIGNALS ========= */
 // Rebrand knobs — change these strings to rename the whole tab in one place.
-// e.g. Frequencies / Keys / Cipher / Orbit — and update the nav label + router.
 const SIGNAL = {
   tab: "Signals",
   code: "Your Signal Code",
@@ -493,6 +492,10 @@ const SIGNAL = {
   pending: "Pending",
   linked: "Linked"
 };
+
+// Live view handle so action handlers can update the lists instantly (optimistic)
+// and reconcile in the background, instead of waiting on a second round-trip.
+let _signals = null;
 
 function myCodeText() {
   const c = state.user && state.user.pairingCode;
@@ -515,7 +518,29 @@ function paintMyCode(box) {
   ]));
 }
 
-function paintConnect(box, reload) {
+/**
+ * Optimistic Signals action: apply a local change to the lists immediately,
+ * repaint, then confirm with the server in the background. On failure, re-fetch
+ * the truth so the UI can't drift.
+ */
+function signalOptimistic(mutate, apiCall, okToast) {
+  if (!_signals || !_signals.data) {
+    apiCall().then(() => { if (_signals && _signals.reload) _signals.reload(); })
+      .catch((e) => { if (isSessionDead(e)) forceReLogin(e); else toast(errText(e), "error"); });
+    return;
+  }
+  try { mutate(); _signals.repaint(); } catch (e) {}
+  apiCall().then(() => {
+    if (okToast) toast(okToast, "success");
+    state.mem.contactsAt = Date.now(); // keep cache "fresh" so a revisit doesn't flicker
+  }).catch((e) => {
+    if (isSessionDead(e)) { forceReLogin(e); return; }
+    toast(errText(e), "error");
+    if (_signals && _signals.reload) _signals.reload(); // restore server truth
+  });
+}
+
+function paintConnect(box) {
   box.textContent = "";
   const input = el("input", {
     class: "input", type: "text", inputmode: "numeric", maxlength: "5",
@@ -526,17 +551,28 @@ function paintConnect(box, reload) {
   const submit = async () => {
     const code = input.value.replace(/\D/g, "");
     if (code.length !== 5) { toast("Enter the full 5-digit code", "error"); return; }
-    btn.disabled = true; const label = btn.textContent; btn.textContent = "Sending…";
+    btn.disabled = true; const orig = btn.textContent; btn.textContent = "Sending…";
     try {
-      const data = await call("pairByCode", { code });
+      const data = await call("pairByCode", { code }); // foreground — jumps the queue
       input.value = "";
-      if (data && data.alreadyPaired) toast("Already linked", "info");
-      else if (data && data.linked) toast("Linked!", "success");
-      else if (data && data.pending) toast("Already requested", "info");
-      else toast("Request sent", "success");
-      if (reload) reload();
+      const d = _signals && _signals.data;
+      if (data && data.alreadyPaired) { toast("Already linked", "info"); }
+      else if (data && data.linked) {
+        toast("Linked!", "success");
+        if (d && data.request) {
+          const me = state.user && state.user.userId;
+          const other = (data.request.requester && data.request.requester.userId === me)
+            ? data.request.receiver : data.request.requester;
+          if (other) { d.paired = d.paired || []; d.paired.push(other); _signals.repaint(); }
+        }
+      }
+      else if (data && data.pending) { toast("Already requested", "info"); }
+      else {
+        toast("Request sent", "success");
+        if (d && data.request) { d.outgoing = d.outgoing || []; d.outgoing.push(data.request); _signals.repaint(); }
+      }
     } catch (e) { toast(errText(e), "error"); }
-    finally { btn.disabled = false; btn.textContent = label; }
+    finally { btn.disabled = false; btn.textContent = orig; }
   };
   btn.addEventListener("click", submit);
   input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
@@ -548,18 +584,30 @@ function paintConnect(box, reload) {
   ]));
 }
 
-function paintSignalRequests(box, incoming, outgoing, reload) {
+function paintSignalRequests(box, incoming, outgoing) {
   box.textContent = "";
   if (incoming && incoming.length) {
     box.appendChild(el("h3", { class: "section__title", text: SIGNAL.requests }));
     incoming.forEach((r) => {
       const u = r.requester || {};
-      const accept = el("button", { class: "btn btn--sm btn--primary", text: "Accept", onclick: async () => {
-        try { await call("acceptContactRequest", { contactId: r.contactId }); toast("Linked", "success"); if (reload) reload(); }
-        catch (e) { toast(errText(e), "error"); } } });
-      const decline = el("button", { class: "btn btn--sm btn--ghost", text: "Decline", onclick: async () => {
-        try { await call("rejectContactRequest", { contactId: r.contactId }); if (reload) reload(); }
-        catch (e) { toast(errText(e), "error"); } } });
+      const accept = el("button", { class: "btn btn--sm btn--primary", text: "Accept", onclick: () => {
+        signalOptimistic(
+          () => {
+            const d = _signals.data;
+            d.incoming = (d.incoming || []).filter((x) => x.contactId !== r.contactId);
+            d.paired = d.paired || [];
+            if (r.requester) d.paired.push(r.requester);
+          },
+          () => call("acceptContactRequest", { contactId: r.contactId }),
+          "Linked"
+        );
+      } });
+      const decline = el("button", { class: "btn btn--sm btn--ghost", text: "Decline", onclick: () => {
+        signalOptimistic(
+          () => { const d = _signals.data; d.incoming = (d.incoming || []).filter((x) => x.contactId !== r.contactId); },
+          () => call("rejectContactRequest", { contactId: r.contactId })
+        );
+      } });
       box.appendChild(el("div", { class: "row row--compact" }, [
         avatar(u, 44),
         el("div", { class: "row__main" }, [
@@ -574,9 +622,13 @@ function paintSignalRequests(box, incoming, outgoing, reload) {
     box.appendChild(el("h3", { class: "section__title", text: SIGNAL.pending }));
     outgoing.forEach((r) => {
       const u = r.receiver || {};
-      const cancel = el("button", { class: "btn btn--sm btn--ghost", text: "Cancel", onclick: async () => {
-        try { await call("cancelContactRequest", { contactId: r.contactId }); toast("Request cancelled", "success"); if (reload) reload(); }
-        catch (e) { toast(errText(e), "error"); } } });
+      const cancel = el("button", { class: "btn btn--sm btn--ghost", text: "Cancel", onclick: () => {
+        signalOptimistic(
+          () => { const d = _signals.data; d.outgoing = (d.outgoing || []).filter((x) => x.contactId !== r.contactId); },
+          () => call("cancelContactRequest", { contactId: r.contactId }),
+          "Request cancelled"
+        );
+      } });
       box.appendChild(el("div", { class: "row row--compact" }, [
         avatar(u, 44),
         el("div", { class: "row__main" }, [
@@ -605,9 +657,13 @@ function paintLinked(box, paired) {
       ]),
       el("div", { class: "row__actions" }, [
         el("button", { class: "btn btn--sm btn--ghost", text: "Message", onclick: () => startChat(u) }),
-        el("button", { class: "btn btn--sm btn--danger", text: "Remove", onclick: async () => {
-          try { await call("removeContact", { userId: u.userId }); toast("Removed", "success"); if (state.poll.fn) state.poll.fn(); }
-          catch (e) { toast(errText(e), "error"); } } })
+        el("button", { class: "btn btn--sm btn--danger", text: "Remove", onclick: () => {
+          signalOptimistic(
+            () => { const d = _signals.data; d.paired = (d.paired || []).filter((x) => x.userId !== u.userId); },
+            () => call("removeContact", { userId: u.userId }),
+            "Removed"
+          );
+        } })
       ])
     ]));
   });
@@ -625,24 +681,39 @@ async function renderSignals() {
   shell(header, [codeBox, connectBox, requestsBox, linkedBox]);
 
   const reload = () => { if (state.poll.fn) state.poll.fn(); };
+  _signals = {
+    data: null,
+    boxes: { requests: requestsBox, linked: linkedBox },
+    reload: reload,
+    repaint: function () {
+      if (this.data && state.route.name === "signals") {
+        paintSignalRequests(this.boxes.requests, this.data.incoming || [], this.data.outgoing || []);
+        paintLinked(this.boxes.linked, this.data.paired || []);
+      }
+    }
+  };
 
   paintMyCode(codeBox);
-  paintConnect(connectBox, reload);
+  paintConnect(connectBox);
 
   function applyPayload(data) {
-    paintSignalRequests(requestsBox, data.incoming || [], data.outgoing || [], reload);
-    paintLinked(linkedBox, data.paired || data.contacts || []);
+    if (!data.paired) data.paired = data.contacts || []; // normalize older cache shape
+    _signals.data = data;
+    _signals.repaint();
   }
 
   async function loadAll(silent) {
     try {
       let data;
       try {
-        data = await call("pairingHome", {});
+        data = await call("pairingHome", {}, { background: true });
       } catch (e) {
         if (!(e instanceof ApiError) || e.code === "NETWORK" || e.code === "TIMEOUT") throw e;
         // Fallback if the backend hasn't been updated to pairingHome yet
-        const [cts, reqs] = await Promise.all([call("listContacts", {}), call("listContactRequests", {})]);
+        const [cts, reqs] = await Promise.all([
+          call("listContacts", {}, { background: true }),
+          call("listContactRequests", {}, { background: true })
+        ]);
         data = { paired: cts.contacts || [], incoming: reqs.incoming || [], outgoing: reqs.outgoing || [] };
       }
       state.mem.contacts = data;
@@ -753,7 +824,7 @@ async function pollConversation(thread, first) {
     const pending = await DB.getPending();
     if (pending.length) flushPending().catch(() => {});
 
-    const { messages, readUpTo } = await call("getMessages", { conversationId: ac.conversationId, afterSequence: ac.lastSequence });
+    const { messages, readUpTo } = await call("getMessages", { conversationId: ac.conversationId, afterSequence: ac.lastSequence }, { background: true });
     if (messages.length) {
       await DB.putMessages(ac.conversationId, messages);
       const wasBottom = nearBottom(thread);
@@ -773,7 +844,7 @@ async function refreshPresence() {
   if (!ac || state.poll.presenceInFlight) return;
   state.poll.presenceInFlight = true;
   try {
-    const { conversation } = await call("getConversation", { conversationId: ac.conversationId });
+    const { conversation } = await call("getConversation", { conversationId: ac.conversationId }, { background: true });
     ac.otherUser = conversation.otherUser || ac.otherUser;
     const sub = $(".topbar__subtitle");
     if (sub) { sub.textContent = lastSeenText(ac.otherUser); sub.classList.toggle("is-online", !!ac.otherUser.online); }
