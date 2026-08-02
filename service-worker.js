@@ -2,7 +2,7 @@
 //  Ripple service worker — offline app shell.
 //  Bump CACHE_VERSION whenever you deploy new frontend files.
 // =============================================================================
-const CACHE_VERSION = "clocker-v31";
+const CACHE_VERSION = "clocker-v32";
 const SHELL = [
   "./",
   "./index.html",
