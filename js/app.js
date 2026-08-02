@@ -674,7 +674,7 @@ async function renderConversation(conversationId) {
       status: "pending", createdAt: new Date().toISOString(), sequenceNumber: 999999999
     };
     await DB.addPending(pending);
-    appendMessage(thread, pending, true);
+    appendMessage(thread, pending);
     scrollBottom(thread);
     sendBtn.classList.add("composer__send--pulse");
     setTimeout(() => sendBtn.classList.remove("composer__send--pulse"), 400);
@@ -686,7 +686,7 @@ async function renderConversation(conversationId) {
   const visible = cached.filter((m) => (m.sequenceNumber || 0) > state.activeConversation.clearedBefore);
   paintThread(thread, visible);
   const pend = (await DB.getPending()).filter((p) => p.conversationId === conversationId);
-  pend.forEach((p) => appendMessage(thread, p, true));
+  pend.forEach((p) => appendMessage(thread, p));
   if (visible.length) state.activeConversation.lastSequence = visible[visible.length - 1].sequenceNumber || 0;
   scrollBottom(thread);
 
