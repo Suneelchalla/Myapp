@@ -30,13 +30,38 @@ const COALESCE = new Set([
   "listContacts", "listContactRequests", "getConversation", "validateSession"
 ]);
 const _inflight = new Map();
-/** GAS is single-threaded — never overlap requests (overlap = multi-second UI freeze). */
-let _gate = Promise.resolve();
+/**
+ * GAS is single-threaded — never overlap requests (overlap = multi-second UI freeze).
+ * A tiny priority queue keeps that guarantee (one call at a time) but lets
+ * user-initiated calls jump ahead of background polls, so a tap doesn't sit
+ * behind a refresh. Pass { background: true } to send a call to the back.
+ */
+const _pending = [];   // waiting jobs: { fn, resolve, reject, bg }
+let _active = false;
 
-function enqueue(fn) {
-  const run = _gate.then(fn, fn);
-  _gate = run.then(() => {}, () => {});
-  return run;
+function _pump() {
+  if (_active) return;
+  const job = _pending.shift();
+  if (!job) return;
+  _active = true;
+  Promise.resolve().then(job.fn).then(
+    (v) => { _active = false; job.resolve(v); _pump(); },
+    (e) => { _active = false; job.reject(e); _pump(); }
+  );
+}
+
+function enqueue(fn, bg) {
+  return new Promise((resolve, reject) => {
+    const job = { fn: fn, resolve: resolve, reject: reject, bg: !!bg };
+    if (bg) {
+      _pending.push(job);                 // background → back of the line
+    } else {                              // foreground → ahead of background, FIFO among foreground
+      let i = 0;
+      while (i < _pending.length && !_pending[i].bg) i++;
+      _pending.splice(i, 0, job);
+    }
+    _pump();
+  });
 }
 
 /**
@@ -52,16 +77,17 @@ export async function call(action, payload = {}, opts = {}) {
 
   // Ping wakes the script — short timeout, still queued so login follows a warm server
   if (action === "ping") {
-    return enqueue(() => doFetch(action, payload, { ...opts, timeoutMs: 12000 }));
+    return enqueue(() => doFetch(action, payload, { ...opts, timeoutMs: 12000 }), true);
   }
 
+  const bg = !!opts.background;
   const coalesce = COALESCE.has(action);
   const key = coalesce
     ? action + "|" + JSON.stringify(payload || {}) + "|" + (opts.token !== undefined ? opts.token : _token)
     : null;
   if (key && _inflight.has(key)) return _inflight.get(key);
 
-  const p = enqueue(() => doFetch(action, payload, opts)).finally(() => {
+  const p = enqueue(() => doFetch(action, payload, opts), bg).finally(() => {
     if (key) _inflight.delete(key);
   });
   if (key) _inflight.set(key, p);
