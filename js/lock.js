@@ -7,7 +7,7 @@
 //  While locked: chat UI torn down; token/messages sealed with AES-GCM (key from PIN).
 // =============================================================================
 import { DB } from "./db.js";
-import { deriveKey, randomBytes, bytesToB64, b64ToBytes } from "./crypto.js";
+import { deriveKey, decryptJson, randomBytes, bytesToB64, b64ToBytes } from "./crypto.js";
 
 async function sha256Hex(str) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
@@ -87,13 +87,20 @@ export const AppLock = {
     if (!c) throw new Error("Time must look like 11:30 (00:00–23:59).");
     const salt = rnd();
     const kdfSalt = randomBytes(16);
+    // v3: no cheap SHA-256 verifier is stored on disk. The correct time is
+    // recognised by trial-decrypting the AES-GCM vault, so each guess now costs a
+    // full PBKDF2 derivation instead of a single SHA-256.
+    //
+    // IMPORTANT: a clock time is only ~1440 possibilities (~10.5 bits). This raises
+    // the per-guess cost but CANNOT make the secret strong. Anyone who images this
+    // device can still brute-force the vault offline in minutes. Treat the lock as
+    // deniability / shoulder-surfing cover, not as protection against forensics.
     this._cfg = {
       enabled: true,
       salt,
       kdfSalt: bytesToB64(kdfSalt),
-      kdfIters: 60000,
-      chatHash: await sha256Hex(salt + "|chat|" + c),
-      v: 2
+      kdfIters: 310000,   // OWASP-ish for PBKDF2-HMAC-SHA256; ~0.3s on a modern phone
+      v: 3
     };
     await DB.setKV("lock", this._cfg);
     this._key = await deriveKey(c, kdfSalt, this._cfg.kdfIters);
@@ -121,9 +128,28 @@ export const AppLock = {
   async _isChatPin(pin) {
     if (!this._cfg.enabled) return true;
     const dig = normalizeTimePin(pin) || String(pin || "").replace(/\D/g, "");
+    // Legacy (v2) and pre-v2 installs stored a cheap SHA-256 verifier on disk.
+    // Still honoured so upgrading users are never locked out of their vault.
     if (this._cfg.chatHash && (await sha256Hex(this._cfg.salt + "|chat|" + dig)) === this._cfg.chatHash) return true;
     if (this._cfg.hash && (await sha256Hex(this._cfg.salt + "|" + dig)) === this._cfg.hash) return true;
+    // v3: nothing cheap on disk. The correct time is simply the one whose derived
+    // key decrypts the vault — forcing a full PBKDF2 per guess (no SHA-256 shortcut).
+    if (!this._cfg.chatHash && !this._cfg.hash) return await this._vaultAccepts(dig);
     return false;
+  },
+
+  /** True iff `dig` derives a key that authenticates (decrypts) the stored vault. */
+  async _vaultAccepts(dig) {
+    let blob = null;
+    try { blob = await DB.getKV("vault"); } catch (e) { blob = null; }
+    if (!blob) return false;
+    try {
+      const key = await deriveKey(dig, this._kdfSaltBytes(), this._cfg.kdfIters || 100000);
+      await decryptJson(key, blob); // AES-GCM auth tag throws on a wrong key
+      return true;
+    } catch (e) {
+      return false;
+    }
   },
 
   /** Derive vault key after a successful PIN check. */
@@ -270,21 +296,12 @@ export const AppLock = {
     this._timeEl.setAttribute("aria-label", "Long press or double tap to set alarm");
     this._dateEl = el("div", "lock-date");
 
-    // Android-friendly unlock doors on the clock face
+    // Android-friendly unlock doors on the clock face: long-press or double-tap the time
     this._bindDoubleTap(this._timeEl, () => this._openSheet());
     this._bindLongPress(this._timeEl, () => this._openSheet());
 
-    const chip = el("button", "clock-chip");
-    chip.type = "button";
-    this._chipEl = chip;
-    chip.addEventListener("click", () => {
-      this._switchTab("alarm");
-      this._openSheet();
-    });
-
-    face.append(this._timeEl, this._dateEl, chip);
+    face.append(this._timeEl, this._dateEl);
     page.appendChild(face);
-    this._updateChip();
     return page;
   },
 
